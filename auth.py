@@ -1,6 +1,7 @@
 """
-Авторизация через GitHub Gist (модуль gist_storage).
-Ключ — user_id (TG ID пользователя).
+Авторизация через GitHub Gist.
+После любой мутации (authorize/remove/ban) кэш инвалидируется
+чтобы все процессы при следующем чтении увидели свежие данные.
 """
 import logging
 import threading
@@ -46,8 +47,15 @@ class AuthorizedUser:
 
 
 def is_authorized(user_id: int) -> bool:
+    """
+    Админы всегда авторизованы.
+    Для остальных — читаем напрямую из Gist (минуя кэш), чтобы /remove
+    срабатывал моментально.
+    """
     if user_id in config.ADMIN_CHAT_IDS:
         return True
+    # Без кэша — гарантия что после /remove пользователь сразу заблокирован
+    gist_storage.invalidate_cache()
     data = gist_storage.read(FILE)
     user = data.get(str(user_id))
     if not user:
@@ -61,7 +69,10 @@ def is_admin(user_id: int) -> bool:
 
 def authorize(user_id: int, username: str, first_name: str) -> AuthorizedUser:
     with _lock:
+        # Принудительно перечитываем из Gist — на случай если данные изменили другие процессы
+        gist_storage.invalidate_cache()
         data = gist_storage.read(FILE)
+
         existing = data.get(str(user_id))
         authorized_at = (
             existing.get("authorized_at") if existing
@@ -75,30 +86,41 @@ def authorize(user_id: int, username: str, first_name: str) -> AuthorizedUser:
         )
         data[str(user_id)] = user.to_dict()
         gist_storage.write(FILE, data)
-        logger.info(f"Авторизован: {user_id} (@{username}). Всего: {len(data)}")
+        logger.info(f"AUTHORIZED: {user_id} (@{username}). Всего юзеров: {len(data)}")
         return user
 
 
 def list_users() -> list[AuthorizedUser]:
+    # Всегда свежие данные при запросе списка
+    gist_storage.invalidate_cache()
     data = gist_storage.read(FILE)
     return [AuthorizedUser.from_dict(u) for u in data.values()]
 
 
 def remove_user(user_id: int) -> bool:
     with _lock:
+        gist_storage.invalidate_cache()
         data = gist_storage.read(FILE)
-        if str(user_id) in data:
-            del data[str(user_id)]
-            gist_storage.write(FILE, data)
-            return True
-        return False
+        if str(user_id) not in data:
+            logger.warning(f"REMOVE: {user_id} не найден в Gist (есть {list(data.keys())})")
+            return False
+        del data[str(user_id)]
+        gist_storage.write(FILE, data)
+        # Дополнительная инвалидация чтобы другие процессы не использовали свой кэш
+        gist_storage.invalidate_cache()
+        logger.info(f"REMOVED: {user_id}. Осталось юзеров: {len(data)}")
+        return True
 
 
 def set_banned(user_id: int, banned: bool) -> bool:
     with _lock:
+        gist_storage.invalidate_cache()
         data = gist_storage.read(FILE)
         if str(user_id) not in data:
+            logger.warning(f"BAN: {user_id} не найден")
             return False
         data[str(user_id)]["banned"] = banned
         gist_storage.write(FILE, data)
+        gist_storage.invalidate_cache()
+        logger.info(f"BAN={banned}: {user_id}")
         return True
