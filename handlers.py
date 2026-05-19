@@ -182,7 +182,15 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @require_admin
 async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    users = auth.list_users()
+    logger.info(f"/users вызвана пользователем {update.effective_user.id}")
+    try:
+        users = auth.list_users()
+        logger.info(f"/users: список из {len(users)} пользователей загружен")
+    except Exception as e:
+        logger.exception(f"/users: ошибка чтения списка: {e}")
+        await update.message.reply_text(f"❌ Ошибка чтения списка: {e}")
+        return
+
     if not users:
         await update.message.reply_text("📭 Авторизованных пользователей пока нет.")
         return
@@ -201,7 +209,15 @@ async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     lines.append("\n*Команды:*")
     lines.append("`/ban <user_id>` `/unban <user_id>` `/remove <user_id>`")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    try:
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        logger.exception(f"/users: ошибка отправки: {e}")
+        # Если упало из-за Markdown — пробуем без него
+        try:
+            await update.message.reply_text("\n".join(lines))
+        except Exception as e2:
+            await update.message.reply_text(f"❌ Не удалось отправить: {e2}")
 
 
 @require_admin
