@@ -357,13 +357,29 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        added = storage.add_predictions(chat_id, preds)
+        added = storage.add_predictions(new_preds=preds)
         skipped = len(preds) - added
         lines = [f"✅ *Добавлено: {added}*" + (f"  (дублей: {skipped})" if skipped else "")]
         for i, p in enumerate(preds, 1):
             t = format_time_local(p, s.timezone_offset)
             lines.append(f"\n{i}. ⏰ {t}\n   {p.text}")
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+        # Broadcast другим авторизованным пользователям (кроме того кто добавил)
+        if added > 0:
+            recipients = storage.get_all_recipient_chat_ids()
+            for rid in recipients:
+                if rid == chat_id:
+                    continue  # тот кто добавил уже видит сообщение
+                try:
+                    rs = storage.load_settings(rid)
+                    rlines = [f"📥 Админ добавил +{added} прогнозов"]
+                    for p in preds[-added:]:
+                        t = format_time_local(p, rs.timezone_offset)
+                        rlines.append(f"⏰ {t}  {p.text}")
+                    await ctx.bot.send_message(chat_id=rid, text="\n".join(rlines))
+                except Exception as e:
+                    logger.error(f"broadcast add to {rid} failed: {e}")
         return
 
 

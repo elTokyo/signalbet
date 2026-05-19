@@ -25,46 +25,54 @@ def setup_scheduler(app: Application):
 
 
 async def notification_tick(app: Application):
-    """Каждые 30 секунд: уведомления + автоудаление."""
+    """Каждые 30 секунд: проверка прогнозов и рассылка уведомлений всем."""
     now = datetime.utcnow()
     cutoff = now - timedelta(minutes=config.DELETE_AFTER_MINUTES)
 
-    for chat_id in storage.get_all_chat_ids():
-        predictions = storage.load_predictions(chat_id)
-        changed = False
-        kept = []
+    predictions = storage.load_predictions()
+    if not predictions:
+        return
 
-        for pred in predictions:
-            # ── автоудаление: матч начался >5 минут назад ───────────────────
-            if pred.match_time <= cutoff:
-                logger.info(f"[cleanup] {chat_id}: удалён '{pred.text[:50]}...'")
-                changed = True
-                continue
+    recipients = storage.get_all_recipient_chat_ids()
+    if not recipients:
+        return
 
-            diff_min = (pred.match_time - now).total_seconds() / 60
+    changed = False
+    kept = []
 
-            # ── уведомление за 30 минут ─────────────────────────────────────
-            if not pred.notified_30 and 28 <= diff_min <= 32:
-                if await _send(app, chat_id, format_reminder(pred, 30)):
-                    pred.notified_30 = True
-                    changed = True
+    for pred in predictions:
+        # Автоудаление прогноза если матч начался >5 минут назад
+        if pred.match_time <= cutoff:
+            logger.info(f"[cleanup] удалён: {pred.text[:50]}...")
+            changed = True
+            continue
 
-            # ── уведомление за 5 минут ──────────────────────────────────────
-            if not pred.notified_5 and 3 <= diff_min <= 7:
-                if await _send(app, chat_id, format_reminder(pred, 5)):
-                    pred.notified_5 = True
-                    changed = True
+        diff_min = (pred.match_time - now).total_seconds() / 60
 
-            kept.append(pred)
+        # За 30 минут
+        if not pred.notified_30 and 28 <= diff_min <= 32:
+            await _broadcast(app, recipients, format_reminder(pred, 30))
+            pred.notified_30 = True
+            changed = True
+            logger.info(f"[30min] отправлено {len(recipients)} получателям: {pred.text[:50]}")
 
-        if changed:
-            storage.save_predictions(chat_id, kept)
+        # За 5 минут
+        if not pred.notified_5 and 3 <= diff_min <= 7:
+            await _broadcast(app, recipients, format_reminder(pred, 5))
+            pred.notified_5 = True
+            changed = True
+            logger.info(f"[5min] отправлено {len(recipients)} получателям: {pred.text[:50]}")
+
+        kept.append(pred)
+
+    if changed:
+        storage.save_predictions(predictions=kept)
 
 
-async def _send(app: Application, chat_id: int, text: str) -> bool:
-    try:
-        await app.bot.send_message(chat_id=chat_id, text=text)
-        return True
-    except Exception as e:
-        logger.error(f"send_message error to {chat_id}: {e}")
-        return False
+async def _broadcast(app: Application, chat_ids: list[int], text: str):
+    """Отправляет одно сообщение всем получателям."""
+    for chat_id in chat_ids:
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=text)
+        except Exception as e:
+            logger.error(f"send_message {chat_id} failed: {e}")
