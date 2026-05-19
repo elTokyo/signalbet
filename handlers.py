@@ -277,6 +277,78 @@ async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @require_admin
+async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Рассылка сообщения всем авторизованным пользователям от имени админа.
+    Можно использовать двумя способами:
+    1. /broadcast <текст сообщения>
+    2. /broadcast (пустая команда) → бот попросит ввести текст следующим сообщением
+    """
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    # Если текст указан после команды — рассылаем сразу
+    if ctx.args:
+        text = " ".join(ctx.args)
+        await _do_broadcast(update, ctx, text)
+        return
+
+    # Иначе включаем режим ожидания текста
+    PENDING_INPUT[(chat_id, user_id)] = "broadcast"
+    await update.message.reply_text(
+        "📢 Введи текст для рассылки следующим сообщением.\n"
+        "Сообщение получат все авторизованные пользователи.\n\n"
+        "Чтобы отменить — напиши /cancel"
+    )
+
+
+async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Сбрасывает любой режим ожидания ввода."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    if PENDING_INPUT.pop((chat_id, user_id), None):
+        await update.message.reply_text("❌ Отменено.")
+    else:
+        await update.message.reply_text("Нечего отменять.")
+
+
+async def _do_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    """Выполняет рассылку текста всем авторизованным."""
+    text = text.strip()
+    if not text:
+        await update.message.reply_text("❌ Пустое сообщение, нечего рассылать.")
+        return
+
+    sender = update.effective_user
+    sender_name = sender.first_name or "Админ"
+
+    recipients = storage.get_all_recipient_chat_ids()
+    if not recipients:
+        await update.message.reply_text("📭 Нет получателей.")
+        return
+
+    message = f"📢 Сообщение от {sender_name}:\n\n{text}"
+
+    sent = 0
+    failed = 0
+    for rid in recipients:
+        # Не отправляем самому отправителю — он и так видит что напечатал
+        if rid == update.effective_chat.id:
+            continue
+        try:
+            await ctx.bot.send_message(chat_id=rid, text=message)
+            sent += 1
+        except Exception as e:
+            failed += 1
+            logger.error(f"broadcast to {rid} failed: {e}")
+
+    summary = f"✅ Разослано: {sent}"
+    if failed > 0:
+        summary += f" (не доставлено: {failed})"
+    await update.message.reply_text(summary)
+
+
+@require_admin
 async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Диагностика конфигурации бота."""
     import gist_storage
@@ -347,6 +419,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     s = storage.load_settings(chat_id)
+
+    # ── Рассылка от админа ────────────────────────────────────────────────
+    if mode == "broadcast":
+        if not auth.is_admin(user_id):
+            return
+        await _do_broadcast(update, ctx, update.message.text)
+        return
 
     if mode == "timezone":
         if not auth.is_admin(user_id):

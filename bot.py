@@ -65,11 +65,13 @@ def main():
     app.add_handler(CommandHandler("settings", handlers.cmd_settings))
 
     # Админ-команды
-    app.add_handler(CommandHandler("users",    handlers.cmd_users))
-    app.add_handler(CommandHandler("ban",      handlers.cmd_ban))
-    app.add_handler(CommandHandler("unban",    handlers.cmd_unban))
-    app.add_handler(CommandHandler("remove",   handlers.cmd_remove))
-    app.add_handler(CommandHandler("debug",    handlers.cmd_debug))
+    app.add_handler(CommandHandler("users",     handlers.cmd_users))
+    app.add_handler(CommandHandler("ban",       handlers.cmd_ban))
+    app.add_handler(CommandHandler("unban",     handlers.cmd_unban))
+    app.add_handler(CommandHandler("remove",    handlers.cmd_remove))
+    app.add_handler(CommandHandler("debug",     handlers.cmd_debug))
+    app.add_handler(CommandHandler("broadcast", handlers.cmd_broadcast))
+    app.add_handler(CommandHandler("cancel",    handlers.cmd_cancel))
 
     # Кнопки + текст
     app.add_handler(CallbackQueryHandler(handlers.on_callback))
