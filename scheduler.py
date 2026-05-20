@@ -6,13 +6,20 @@ from telegram.ext import Application
 
 import storage
 import config
+import auth
 from parser import format_reminder
+from fonbet import fetch_events, find_matching_event, extract_teams_from_prediction
 
 logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler()
 
+# Окно мониторинга Фонбета: за час до старта → +20 мин после старта
+FONBET_WINDOW_BEFORE_MIN = 60
+FONBET_WINDOW_AFTER_MIN  = 20
+
 
 def setup_scheduler(app: Application):
+    # Job 1: таймер-напоминания + автоудаление (каждые 30 сек)
     scheduler.add_job(
         notification_tick,
         trigger=IntervalTrigger(seconds=30),
@@ -20,12 +27,21 @@ def setup_scheduler(app: Application):
         id="notification_tick",
         replace_existing=True,
     )
+    # Job 2: проверка Фонбета (каждые 60 сек)
+    scheduler.add_job(
+        fonbet_tick,
+        trigger=IntervalTrigger(seconds=60),
+        args=[app],
+        id="fonbet_tick",
+        replace_existing=True,
+    )
     scheduler.start()
-    logger.info("Scheduler запущен: проверка каждые 30 секунд")
+    logger.info("Scheduler запущен: notifications 30с, fonbet 60с")
 
+
+# ── Уведомления за 30/5 мин + автоудаление ───────────────────────────────────
 
 async def notification_tick(app: Application):
-    """Каждые 30 секунд: проверка прогнозов и рассылка уведомлений всем."""
     now = datetime.utcnow()
     cutoff = now - timedelta(minutes=config.DELETE_AFTER_MINUTES)
 
@@ -41,27 +57,22 @@ async def notification_tick(app: Application):
     kept = []
 
     for pred in predictions:
-        # Автоудаление прогноза если матч начался >5 минут назад
         if pred.match_time <= cutoff:
-            logger.info(f"[cleanup] удалён: {pred.text[:50]}...")
+            logger.info(f"[cleanup] {pred.text[:50]}...")
             changed = True
             continue
 
         diff_min = (pred.match_time - now).total_seconds() / 60
 
-        # За 30 минут
         if not pred.notified_30 and 28 <= diff_min <= 32:
             await _broadcast(app, recipients, format_reminder(pred, 30))
             pred.notified_30 = True
             changed = True
-            logger.info(f"[30min] отправлено {len(recipients)} получателям: {pred.text[:50]}")
 
-        # За 5 минут
         if not pred.notified_5 and 3 <= diff_min <= 7:
             await _broadcast(app, recipients, format_reminder(pred, 5))
             pred.notified_5 = True
             changed = True
-            logger.info(f"[5min] отправлено {len(recipients)} получателям: {pred.text[:50]}")
 
         kept.append(pred)
 
@@ -69,8 +80,93 @@ async def notification_tick(app: Application):
         storage.save_predictions(predictions=kept)
 
 
+# ── Fonbet: prematch + live ──────────────────────────────────────────────────
+
+async def fonbet_tick(app: Application):
+    """Каждые 60 сек: проверяет Fonbet на появление прогнозов prematch/live."""
+    now = datetime.utcnow()
+    predictions = storage.load_predictions()
+    if not predictions:
+        return
+
+    # Отбираем прогнозы которые нужно мониторить
+    to_check = []
+    for p in predictions:
+        if p.fonbet_notified_prematch and p.fonbet_notified_live:
+            continue  # уже всё уведомлено
+        diff_min = (p.match_time - now).total_seconds() / 60
+        # В окне: за 60 мин до старта → +20 мин после старта
+        # (то есть от -20 мин (= матч идёт 20 мин) до 60 мин до старта)
+        if -FONBET_WINDOW_AFTER_MIN <= diff_min <= FONBET_WINDOW_BEFORE_MIN:
+            to_check.append(p)
+
+    if not to_check:
+        return
+
+    # Один запрос к Fonbet для всех
+    events = fetch_events()
+    if not events:
+        return
+
+    # Получатели — только те, у кого включены уведомления Fonbet
+    all_recipients = storage.get_all_recipient_chat_ids()
+    recipients = [
+        rid for rid in all_recipients
+        if storage.load_settings(rid).fonbet_notifications
+    ]
+    if not recipients:
+        return
+
+    changed = False
+    for pred in to_check:
+        event = find_matching_event(pred.text, events)
+        if not event:
+            continue
+
+        # Берём названия команд из ПРОГНОЗА (как просил)
+        team1, team2 = extract_teams_from_prediction(pred.text)
+        odds_line = _format_odds(event.get("odd_p1"), event.get("odd_p2"))
+
+        if event["is_live"] and not pred.fonbet_notified_live:
+            msg = (
+                f"🔴 Матч вышел в лайв!\n"
+                f"{team1} — {team2}\n"
+                f"{odds_line}"
+            )
+            await _broadcast(app, recipients, msg)
+            pred.fonbet_notified_live = True
+            # Раз дошли до live — prematch тоже больше не нужен
+            pred.fonbet_notified_prematch = True
+            changed = True
+            logger.info(f"[fonbet live] {team1} — {team2}")
+
+        elif (not event["is_live"]) and not pred.fonbet_notified_prematch:
+            msg = (
+                f"📋 Матч вышел в прематч!\n"
+                f"{team1} — {team2}\n"
+                f"{odds_line}"
+            )
+            await _broadcast(app, recipients, msg)
+            pred.fonbet_notified_prematch = True
+            changed = True
+            logger.info(f"[fonbet prematch] {team1} — {team2}")
+
+    if changed:
+        storage.save_predictions(predictions=predictions)
+
+
+def _format_odds(odd_p1, odd_p2) -> str:
+    """Форматирует строку с коэффициентами."""
+    if odd_p1 is None and odd_p2 is None:
+        return "(коэф. недоступны)"
+    p1 = f"{odd_p1:.2f}" if odd_p1 is not None else "—"
+    p2 = f"{odd_p2:.2f}" if odd_p2 is not None else "—"
+    return f"П1: {p1}  |  П2: {p2}"
+
+
+# ── Утилита broadcast ────────────────────────────────────────────────────────
+
 async def _broadcast(app: Application, chat_ids: list[int], text: str):
-    """Отправляет одно сообщение всем получателям."""
     for chat_id in chat_ids:
         try:
             await app.bot.send_message(chat_id=chat_id, text=text)

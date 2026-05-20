@@ -87,7 +87,8 @@ async def _send_help(update: Update, user_id: int):
             "/list — список активных\n"
             "/delete <id> — удалить один\n"
             "/clear — очистить все\n"
-            "/settings — настройки\n\n"
+            "/settings — настройки\n"
+            "/broadcast — рассылка всем\n\n"
             "👥 *Управление пользователями:*\n"
             "/users, /ban, /unban, /remove\n\n"
             "🔔 Уведомления за 30 и 5 минут до матча.\n"
@@ -97,7 +98,8 @@ async def _send_help(update: Update, user_id: int):
         text = (
             "⚽ *Бот-помощник для прогнозов*\n\n"
             "📋 *Доступные команды:*\n"
-            "/list — посмотреть активные прогнозы\n\n"
+            "/list — посмотреть активные прогнозы\n"
+            "/feedback — сообщить о баге или оставить отзыв\n\n"
             "🔔 Уведомления о матчах ты получаешь автоматически.\n\n"
             "_Добавление и редактирование прогнозов доступно только админам._"
         )
@@ -129,6 +131,55 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if auth.is_admin(update.effective_user.id):
         lines.append("\nДля удаления: `/delete <id>`")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+@require_auth
+async def cmd_feedback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Обратная связь: пользователь отправляет сообщение, оно уходит админам."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    # Если текст указан сразу после команды
+    if ctx.args:
+        text = " ".join(ctx.args)
+        await _send_feedback(update, ctx, text)
+        return
+
+    PENDING_INPUT[(chat_id, user_id)] = "feedback"
+    await update.message.reply_text(
+        "✍️ Напиши свой отзыв или описание бага следующим сообщением.\n"
+        "Оно будет отправлено администратору.\n\n"
+        "Для отмены — /cancel"
+    )
+
+
+async def _send_feedback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    text = text.strip()
+    if not text:
+        await update.message.reply_text("❌ Пустое сообщение.")
+        return
+
+    user = update.effective_user
+    uname = f"@{user.username}" if user.username else "—"
+    report = (
+        f"📨 Обратная связь\n\n"
+        f"От: {user.first_name or '—'} ({uname})\n"
+        f"🆔 {user.id}\n\n"
+        f"Сообщение:\n{text}"
+    )
+
+    sent = 0
+    for admin_id in config.ADMIN_CHAT_IDS:
+        try:
+            await ctx.bot.send_message(chat_id=admin_id, text=report)
+            sent += 1
+        except Exception as e:
+            logger.error(f"feedback to admin {admin_id} failed: {e}")
+
+    if sent > 0:
+        await update.message.reply_text("✅ Спасибо! Сообщение отправлено администратору.")
+    else:
+        await update.message.reply_text("❌ Не удалось отправить. Попробуй позже.")
 
 
 # ── Команды записи (только админы) ───────────────────────────────────────────
@@ -170,7 +221,11 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     s = storage.load_settings(chat_id)
-    kb = [[InlineKeyboardButton(f"🌐 Часовой пояс: UTC+{s.timezone_offset}", callback_data="set_tz")]]
+    fb_label = "✅ ВКЛ" if s.fonbet_notifications else "☐ ВЫКЛ"
+    kb = [
+        [InlineKeyboardButton(f"🌐 Часовой пояс: UTC+{s.timezone_offset}", callback_data="set_tz")],
+        [InlineKeyboardButton(f"🔴 Уведомления Fonbet: {fb_label}", callback_data="toggle_fonbet")],
+    ]
     await update.message.reply_text(
         "⚙️ *Настройки*\n\nУведомления: за 30 и 5 минут.\nАвтоудаление: через 5 минут после старта.",
         reply_markup=InlineKeyboardMarkup(kb),
@@ -420,6 +475,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     s = storage.load_settings(chat_id)
 
+    # ── Обратная связь (любой авторизованный) ─────────────────────────────
+    if mode == "feedback":
+        await _send_feedback(update, ctx, update.message.text)
+        return
+
     # ── Рассылка от админа ────────────────────────────────────────────────
     if mode == "broadcast":
         if not auth.is_admin(user_id):
@@ -490,7 +550,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("🔒 Доступ закрыт.")
         return
 
-    if q.data in ("clear_yes", "clear_no", "set_tz") and not auth.is_admin(user_id):
+    if q.data in ("clear_yes", "clear_no", "set_tz", "toggle_fonbet") and not auth.is_admin(user_id):
         await q.answer("⛔ Только админ.", show_alert=True)
         return
 
@@ -505,6 +565,21 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         PENDING_INPUT[(chat_id, user_id)] = "timezone"
         await q.edit_message_text(
             "🌐 Введи смещение UTC+N (`3` — Москва, `0` — UTC):",
+            parse_mode="Markdown",
+        )
+
+    elif q.data == "toggle_fonbet":
+        s = storage.load_settings(chat_id)
+        s.fonbet_notifications = not s.fonbet_notifications
+        storage.save_settings(s)
+        fb_label = "✅ ВКЛ" if s.fonbet_notifications else "☐ ВЫКЛ"
+        kb = [
+            [InlineKeyboardButton(f"🌐 Часовой пояс: UTC+{s.timezone_offset}", callback_data="set_tz")],
+            [InlineKeyboardButton(f"🔴 Уведомления Fonbet: {fb_label}", callback_data="toggle_fonbet")],
+        ]
+        await q.edit_message_text(
+            "⚙️ *Настройки*\n\nУведомления: за 30 и 5 минут.\nАвтоудаление: через 5 минут после старта.",
+            reply_markup=InlineKeyboardMarkup(kb),
             parse_mode="Markdown",
         )
 
