@@ -63,6 +63,7 @@ def main():
     app.add_handler(CommandHandler("delete",   handlers.cmd_delete))
     app.add_handler(CommandHandler("clear",    handlers.cmd_clear))
     app.add_handler(CommandHandler("settings", handlers.cmd_settings))
+    app.add_handler(CommandHandler("feedback", handlers.cmd_feedback))
 
     # Админ-команды
     app.add_handler(CommandHandler("users",     handlers.cmd_users))
