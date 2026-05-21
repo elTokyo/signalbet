@@ -23,9 +23,10 @@ FALLBACK_HOSTS = [
     "line-lb03-w.bk6bba-resources.com",
 ]
 
-# Endpoint со списком событий (команды + live-флаг + версия)
-# ВАЖНО: listBase отдаёт только метаданные без events — нужен events/list
-ENDPOINT_PATH = "/ma/events/list?lang=en&scopeMarket=1600"
+# Endpoint со списком событий.
+# version=0 заставляет вернуть ПОЛНЫЙ список, а не дельту изменений.
+# Без version отдаются только что-то изменившиеся события (обычно только live).
+ENDPOINT_PATH = "/ma/events/list?lang=en&scopeMarket=1600&version=0"
 
 HEADERS = {
     "User-Agent": (
