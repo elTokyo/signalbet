@@ -87,7 +87,8 @@ async def _send_help(update: Update, user_id: int):
             "/list — список активных\n"
             "/delete <id> — удалить один\n"
             "/clear — очистить все\n"
-            "/settings — настройки\n\n"
+            "/settings — настройки\n"
+            "/broadcast — рассылка всем\n\n"
             "👥 *Управление пользователями:*\n"
             "/users, /ban, /unban, /remove\n\n"
             "🔔 Уведомления за 30 и 5 минут до матча.\n"
@@ -97,7 +98,8 @@ async def _send_help(update: Update, user_id: int):
         text = (
             "⚽ *Бот-помощник для прогнозов*\n\n"
             "📋 *Доступные команды:*\n"
-            "/list — посмотреть активные прогнозы\n\n"
+            "/list — посмотреть активные прогнозы\n"
+            "/feedback — сообщить о баге или оставить отзыв\n\n"
             "🔔 Уведомления о матчах ты получаешь автоматически.\n\n"
             "_Добавление и редактирование прогнозов доступно только админам._"
         )
@@ -129,6 +131,55 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if auth.is_admin(update.effective_user.id):
         lines.append("\nДля удаления: `/delete <id>`")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+@require_auth
+async def cmd_feedback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Обратная связь: пользователь отправляет сообщение, оно уходит админам."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    # Если текст указан сразу после команды
+    if ctx.args:
+        text = " ".join(ctx.args)
+        await _send_feedback(update, ctx, text)
+        return
+
+    PENDING_INPUT[(chat_id, user_id)] = "feedback"
+    await update.message.reply_text(
+        "✍️ Напиши свой отзыв или описание бага следующим сообщением.\n"
+        "Оно будет отправлено администратору.\n\n"
+        "Для отмены — /cancel"
+    )
+
+
+async def _send_feedback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    text = text.strip()
+    if not text:
+        await update.message.reply_text("❌ Пустое сообщение.")
+        return
+
+    user = update.effective_user
+    uname = f"@{user.username}" if user.username else "—"
+    report = (
+        f"📨 Обратная связь\n\n"
+        f"От: {user.first_name or '—'} ({uname})\n"
+        f"🆔 {user.id}\n\n"
+        f"Сообщение:\n{text}"
+    )
+
+    sent = 0
+    for admin_id in config.ADMIN_CHAT_IDS:
+        try:
+            await ctx.bot.send_message(chat_id=admin_id, text=report)
+            sent += 1
+        except Exception as e:
+            logger.error(f"feedback to admin {admin_id} failed: {e}")
+
+    if sent > 0:
+        await update.message.reply_text("✅ Спасибо! Сообщение отправлено администратору.")
+    else:
+        await update.message.reply_text("❌ Не удалось отправить. Попробуй позже.")
 
 
 # ── Команды записи (только админы) ───────────────────────────────────────────
@@ -170,7 +221,11 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     s = storage.load_settings(chat_id)
-    kb = [[InlineKeyboardButton(f"🌐 Часовой пояс: UTC+{s.timezone_offset}", callback_data="set_tz")]]
+    fb_label = "✅ ВКЛ" if s.fonbet_notifications else "☐ ВЫКЛ"
+    kb = [
+        [InlineKeyboardButton(f"🌐 Часовой пояс: UTC+{s.timezone_offset}", callback_data="set_tz")],
+        [InlineKeyboardButton(f"🔴 Уведомления Fonbet: {fb_label}", callback_data="toggle_fonbet")],
+    ]
     await update.message.reply_text(
         "⚙️ *Настройки*\n\nУведомления: за 30 и 5 минут.\nАвтоудаление: через 5 минут после старта.",
         reply_markup=InlineKeyboardMarkup(kb),
@@ -182,7 +237,15 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @require_admin
 async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    users = auth.list_users()
+    logger.info(f"/users вызвана пользователем {update.effective_user.id}")
+    try:
+        users = auth.list_users()
+        logger.info(f"/users: список из {len(users)} пользователей загружен")
+    except Exception as e:
+        logger.exception(f"/users: ошибка чтения списка: {e}")
+        await update.message.reply_text(f"❌ Ошибка чтения списка: {e}")
+        return
+
     if not users:
         await update.message.reply_text("📭 Авторизованных пользователей пока нет.")
         return
@@ -201,7 +264,15 @@ async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     lines.append("\n*Команды:*")
     lines.append("`/ban <user_id>` `/unban <user_id>` `/remove <user_id>`")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    try:
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        logger.exception(f"/users: ошибка отправки: {e}")
+        # Если упало из-за Markdown — пробуем без него
+        try:
+            await update.message.reply_text("\n".join(lines))
+        except Exception as e2:
+            await update.message.reply_text(f"❌ Не удалось отправить: {e2}")
 
 
 @require_admin
@@ -260,10 +331,193 @@ async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-# ── Обработка текста ─────────────────────────────────────────────────────────
-
-async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+@require_admin
+async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Рассылка сообщения всем авторизованным пользователям от имени админа.
+    Можно использовать двумя способами:
+    1. /broadcast <текст сообщения>
+    2. /broadcast (пустая команда) → бот попросит ввести текст следующим сообщением
+    """
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    # Если текст указан после команды — рассылаем сразу
+    if ctx.args:
+        text = " ".join(ctx.args)
+        await _do_broadcast(update, ctx, text)
+        return
+
+    # Иначе включаем режим ожидания текста
+    PENDING_INPUT[(chat_id, user_id)] = "broadcast"
+    await update.message.reply_text(
+        "📢 Введи текст для рассылки следующим сообщением.\n"
+        "Сообщение получат все авторизованные пользователи.\n\n"
+        "Чтобы отменить — напиши /cancel"
+    )
+
+
+async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Сбрасывает любой режим ожидания ввода."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    if PENDING_INPUT.pop((chat_id, user_id), None):
+        await update.message.reply_text("❌ Отменено.")
+    else:
+        await update.message.reply_text("Нечего отменять.")
+
+
+async def _do_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    """Выполняет рассылку текста всем авторизованным."""
+    text = text.strip()
+    if not text:
+        await update.message.reply_text("❌ Пустое сообщение, нечего рассылать.")
+        return
+
+    sender = update.effective_user
+    sender_name = sender.first_name or "Админ"
+
+    recipients = storage.get_all_recipient_chat_ids()
+    if not recipients:
+        await update.message.reply_text("📭 Нет получателей.")
+        return
+
+    message = f"📢 Сообщение от {sender_name}:\n\n{text}"
+
+    sent = 0
+    failed = 0
+    for rid in recipients:
+        # Не отправляем самому отправителю — он и так видит что напечатал
+        if rid == update.effective_chat.id:
+            continue
+        try:
+            await ctx.bot.send_message(chat_id=rid, text=message)
+            sent += 1
+        except Exception as e:
+            failed += 1
+            logger.error(f"broadcast to {rid} failed: {e}")
+
+    summary = f"✅ Разослано: {sent}"
+    if failed > 0:
+        summary += f" (не доставлено: {failed})"
+    await update.message.reply_text(summary)
+
+
+@require_admin
+async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Диагностика конфигурации бота."""
+    import gist_storage
+
+    pwd_set      = "✅ задан" if config.ACCESS_PASSWORD else "❌ НЕ ЗАДАН"
+    pwd_len      = len(config.ACCESS_PASSWORD) if config.ACCESS_PASSWORD else 0
+    admins       = config.ADMIN_CHAT_IDS or "❌ пусто"
+    gist_token   = "✅ задан" if config.GITHUB_TOKEN else "❌ НЕ ЗАДАН"
+    gist_id      = config.GIST_ID or "❌ НЕ ЗАДАН"
+
+    # Проверка Gist
+    try:
+        users_data = gist_storage.read(gist_storage.FILE_USERS)
+        gist_status = f"✅ работает, пользователей: {len(users_data)}"
+    except Exception as e:
+        gist_status = f"❌ ошибка: {e}"
+
+    user_id = update.effective_user.id
+    is_auth = auth.is_authorized(user_id)
+    is_adm  = auth.is_admin(user_id)
+
+    text = (
+        "🔧 *Диагностика бота*\n\n"
+        f"*ACCESS_PASSWORD:* {pwd_set} (длина: {pwd_len})\n"
+        f"*ADMIN_CHAT_IDS:* `{admins}`\n"
+        f"*GITHUB_TOKEN:* {gist_token}\n"
+        f"*GIST_ID:* `{gist_id}`\n"
+        f"*Gist:* {gist_status}\n\n"
+        f"*Твой user_id:* `{user_id}`\n"
+        f"*Авторизован:* {'✅' if is_auth else '❌'}\n"
+        f"*Админ:* {'✅' if is_adm else '❌'}"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+@require_admin
+async def cmd_checkfonbet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Тест парсера Fonbet: запрашивает события прямо сейчас и сверяет
+    с текущим списком прогнозов. Показывает что найдено, что нет.
+    """
+    import fonbet
+
+    msg = await update.message.reply_text("🔄 Запрашиваю Fonbet...")
+
+    # 1. Проверяем что URL находится
+    host = fonbet.get_working_host()
+    if not host:
+        await msg.edit_text(
+            "❌ Не удалось найти рабочий URL Fonbet.\n"
+            "Ни автодетект, ни fallback-хосты не ответили.\n"
+            "Возможно Fonbet недоступен или сменил адреса."
+        )
+        return
+
+    # 2. Получаем события
+    events = fonbet.fetch_events()
+    if not events:
+        await msg.edit_text(
+            f"⚠️ URL найден (`{host}`), но события не получены.\n"
+            "Возможно изменился формат API.",
+        )
+        return
+
+    # 3. Сверяем с прогнозами
+    predictions = storage.load_predictions()
+    if not predictions:
+        await msg.edit_text(
+            f"✅ Fonbet работает!\n"
+            f"Хост: `{host}`\n"
+            f"Получено событий: {len(events)}\n\n"
+            f"📋 Но список прогнозов пуст — добавь через /add чтобы проверить матчинг.",
+            parse_mode="Markdown",
+        )
+        return
+
+    lines = [
+        f"✅ Fonbet работает!",
+        f"Хост: {host}",
+        f"Событий получено: {len(events)}",
+        f"Прогнозов в списке: {len(predictions)}",
+        "",
+        "── Результаты матчинга ──",
+    ]
+
+    found_count = 0
+    for pred in predictions:
+        team1, team2 = fonbet.extract_teams_from_prediction(pred.text)
+        event = fonbet.find_matching_event(pred.text, events)
+
+        if event:
+            found_count += 1
+            status = "🔴 LIVE" if event["is_live"] else "📋 Прематч"
+            odds = ""
+            if event.get("odd_p1") or event.get("odd_p2"):
+                p1 = f"{event['odd_p1']:.2f}" if event.get("odd_p1") else "—"
+                p2 = f"{event['odd_p2']:.2f}" if event.get("odd_p2") else "—"
+                odds = f" (П1 {p1} / П2 {p2})"
+            lines.append(
+                f"\n✅ {status}{odds}\n"
+                f"   Прогноз: {team1} — {team2}\n"
+                f"   Fonbet: {event['team1']} — {event['team2']}"
+            )
+        else:
+            lines.append(f"\n❌ Не найден: {team1} — {team2}")
+
+    lines.append(f"\n\n📊 Итого найдено: {found_count} из {len(predictions)}")
+
+    text = "\n".join(lines)
+    # Telegram лимит 4096 символов — обрезаем если надо
+    if len(text) > 4000:
+        text = text[:4000] + "\n\n... (список обрезан)"
+
+    await msg.edit_text(text)
     user = update.effective_user
     user_id = user.id
     key = (chat_id, user_id)
@@ -296,6 +550,18 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     s = storage.load_settings(chat_id)
 
+    # ── Обратная связь (любой авторизованный) ─────────────────────────────
+    if mode == "feedback":
+        await _send_feedback(update, ctx, update.message.text)
+        return
+
+    # ── Рассылка от админа ────────────────────────────────────────────────
+    if mode == "broadcast":
+        if not auth.is_admin(user_id):
+            return
+        await _do_broadcast(update, ctx, update.message.text)
+        return
+
     if mode == "timezone":
         if not auth.is_admin(user_id):
             return
@@ -321,13 +587,29 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        added = storage.add_predictions(chat_id, preds)
+        added = storage.add_predictions(new_preds=preds)
         skipped = len(preds) - added
         lines = [f"✅ *Добавлено: {added}*" + (f"  (дублей: {skipped})" if skipped else "")]
         for i, p in enumerate(preds, 1):
             t = format_time_local(p, s.timezone_offset)
             lines.append(f"\n{i}. ⏰ {t}\n   {p.text}")
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+        # Broadcast другим авторизованным пользователям (кроме того кто добавил)
+        if added > 0:
+            recipients = storage.get_all_recipient_chat_ids()
+            for rid in recipients:
+                if rid == chat_id:
+                    continue  # тот кто добавил уже видит сообщение
+                try:
+                    rs = storage.load_settings(rid)
+                    rlines = [f"📥 Админ добавил +{added} прогнозов"]
+                    for p in preds[-added:]:
+                        t = format_time_local(p, rs.timezone_offset)
+                        rlines.append(f"⏰ {t}  {p.text}")
+                    await ctx.bot.send_message(chat_id=rid, text="\n".join(rlines))
+                except Exception as e:
+                    logger.error(f"broadcast add to {rid} failed: {e}")
         return
 
 
@@ -343,7 +625,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("🔒 Доступ закрыт.")
         return
 
-    if q.data in ("clear_yes", "clear_no", "set_tz") and not auth.is_admin(user_id):
+    if q.data in ("clear_yes", "clear_no", "set_tz", "toggle_fonbet") and not auth.is_admin(user_id):
         await q.answer("⛔ Только админ.", show_alert=True)
         return
 
@@ -358,6 +640,21 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         PENDING_INPUT[(chat_id, user_id)] = "timezone"
         await q.edit_message_text(
             "🌐 Введи смещение UTC+N (`3` — Москва, `0` — UTC):",
+            parse_mode="Markdown",
+        )
+
+    elif q.data == "toggle_fonbet":
+        s = storage.load_settings(chat_id)
+        s.fonbet_notifications = not s.fonbet_notifications
+        storage.save_settings(s)
+        fb_label = "✅ ВКЛ" if s.fonbet_notifications else "☐ ВЫКЛ"
+        kb = [
+            [InlineKeyboardButton(f"🌐 Часовой пояс: UTC+{s.timezone_offset}", callback_data="set_tz")],
+            [InlineKeyboardButton(f"🔴 Уведомления Fonbet: {fb_label}", callback_data="toggle_fonbet")],
+        ]
+        await q.edit_message_text(
+            "⚙️ *Настройки*\n\nУведомления: за 30 и 5 минут.\nАвтоудаление: через 5 минут после старта.",
+            reply_markup=InlineKeyboardMarkup(kb),
             parse_mode="Markdown",
         )
 
