@@ -37,7 +37,7 @@ HEADERS = {
     "Accept": "application/json",
 }
 
-FUZZY_THRESHOLD = 75   # минимальный % совпадения команд
+FUZZY_THRESHOLD = 80   # минимальный % совпадения команд (token_sort_ratio)
 CACHE_TTL = 3600       # обновляем URL раз в час
 
 _url_cache: dict = {"url": None, "ts": 0}
@@ -215,6 +215,9 @@ def find_matching_event(pred_text: str, events: list[dict]) -> Optional[dict]:
     """
     Ищет матч из прогноза среди событий Фонбета.
     Возвращает событие если найдено (с коэффициентами), иначе None.
+
+    Использует token_sort_ratio (учитывает ВСЕ слова, а не только вхождение)
+    чтобы 'Канберра' не матчилось с 'Канберра Ювентус'.
     """
     pred_t1, pred_t2 = extract_teams_from_prediction(pred_text)
     if not pred_t1:
@@ -231,11 +234,13 @@ def find_matching_event(pred_text: str, events: list[dict]) -> Optional[dict]:
         e2 = ev["team2"].lower()
 
         if p2:
-            direct = (fuzz.partial_ratio(p1, e1) + fuzz.partial_ratio(p2, e2)) / 2
-            reverse = (fuzz.partial_ratio(p1, e2) + fuzz.partial_ratio(p2, e1)) / 2
+            # token_sort_ratio строже: сравнивает наборы слов целиком.
+            # 'канберра' vs 'канберра ювентус' даст ~60%, а не ~100% как partial_ratio
+            direct = (fuzz.token_sort_ratio(p1, e1) + fuzz.token_sort_ratio(p2, e2)) / 2
+            reverse = (fuzz.token_sort_ratio(p1, e2) + fuzz.token_sort_ratio(p2, e1)) / 2
             score = max(direct, reverse)
         else:
-            score = fuzz.partial_ratio(p1, e1)
+            score = fuzz.token_sort_ratio(p1, e1)
 
         if score > best_score:
             best_score = score
