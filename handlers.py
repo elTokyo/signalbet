@@ -99,6 +99,7 @@ async def _send_help(update: Update, user_id: int):
             "⚽ *Бот-помощник для прогнозов*\n\n"
             "📋 *Доступные команды:*\n"
             "/list — посмотреть активные прогнозы\n"
+            "/settings — твои настройки (часовой пояс, уведомления)\n"
             "/feedback — сообщить о баге или оставить отзыв\n\n"
             "🔔 Уведомления о матчах ты получаешь автоматически.\n\n"
             "_Добавление и редактирование прогнозов доступно только админам._"
@@ -217,17 +218,20 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⚠️ Очистить все прогнозы?", reply_markup=InlineKeyboardMarkup(kb))
 
 
-@require_admin
+@require_auth
 async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    s = storage.load_settings(chat_id)
+    user_id = update.effective_user.id
+    s = storage.load_settings(user_id)
     fb_label = "✅ ВКЛ" if s.fonbet_notifications else "☐ ВЫКЛ"
     kb = [
         [InlineKeyboardButton(f"🌐 Часовой пояс: UTC+{s.timezone_offset}", callback_data="set_tz")],
         [InlineKeyboardButton(f"🔴 Уведомления Fonbet: {fb_label}", callback_data="toggle_fonbet")],
     ]
     await update.message.reply_text(
-        "⚙️ *Настройки*\n\nУведомления: за 30 и 5 минут.\nАвтоудаление: через 5 минут после старта.",
+        "⚙️ *Твои настройки*\n\n"
+        "🌐 Часовой пояс — для отображения времени матчей.\n"
+        "🔴 Уведомления Fonbet — получать ли сигналы о выходе матчей.\n\n"
+        "_Уведомления о матчах приходят за 30 и 5 минут до старта._",
         reply_markup=InlineKeyboardMarkup(kb),
         parse_mode="Markdown",
     )
@@ -559,6 +563,85 @@ async def cmd_syncdiscord(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ {info}")
 
 
+@require_admin
+async def cmd_factors(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Диагностика: дампит ВСЕ факторы (рынки) первого матча из листа прогнозов.
+    Нужно для определения кодов форовых рынков Фонбета.
+    Использование: /factors  — берёт первый прогноз
+                   /factors 3 — берёт прогноз №3 из /list
+    """
+    import fonbet
+
+    predictions = storage.load_predictions()
+    if not predictions:
+        await update.message.reply_text("📋 Список пуст. Добавь прогноз через /add")
+        return
+
+    # Какой прогноз дампить
+    idx = 0
+    if ctx.args:
+        try:
+            idx = int(ctx.args[0]) - 1
+            if idx < 0 or idx >= len(predictions):
+                await update.message.reply_text(f"❌ Нет прогноза №{ctx.args[0]}. Всего: {len(predictions)}")
+                return
+        except ValueError:
+            await update.message.reply_text("❌ Укажи номер: /factors 3")
+            return
+
+    pred = predictions[idx]
+    msg = await update.message.reply_text(f"🔄 Ищу факторы матча:\n{pred.text[:80]}...")
+
+    try:
+        result = fonbet.dump_event_factors(pred.text)
+    except Exception as e:
+        logger.exception(f"/factors error: {e}")
+        await msg.edit_text(f"❌ Ошибка: {e}")
+        return
+
+    if not result:
+        await msg.edit_text(
+            f"❌ Матч не найден на Фонбете:\n{pred.text[:80]}\n\n"
+            "Возможно он сейчас не в линии, или названия слишком разные."
+        )
+        return
+
+    factors = result.get("factors", [])
+    status = "🔴 LIVE" if result["is_live"] else "📋 Прематч"
+
+    lines = [
+        f"{status}  (совпадение {result.get('match_score')}%)",
+        f"{result['team1']} — {result['team2']}",
+        f"Всего факторов: {len(factors)}",
+        "",
+        "Код | Кэф | Параметр",
+        "─────────────────────",
+    ]
+    for f in factors:
+        code = f.get("f")
+        val = f.get("v")
+        pt = f.get("pt")
+        p = f.get("p")
+        param = ""
+        if pt is not None:
+            param = f"  pt={pt}"
+        elif p is not None:
+            param = f"  p={p}"
+        lines.append(f"{code} | {val}{param}")
+
+    text = "\n".join(lines)
+    # Telegram лимит — режем на куски по 4000
+    if len(text) <= 4000:
+        await msg.edit_text(text)
+    else:
+        await msg.edit_text(text[:4000])
+        rest = text[4000:]
+        while rest:
+            await update.message.reply_text(rest[:4000])
+            rest = rest[4000:]
+
+
 # ── Обработка текста ─────────────────────────────────────────────────────────
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -608,14 +691,14 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode == "timezone":
-        if not auth.is_admin(user_id):
-            return
+        # Персональная настройка — доступна всем авторизованным
         try:
             offset = int(update.message.text.strip().replace("+", ""))
             if not -12 <= offset <= 14:
                 raise ValueError
-            s.timezone_offset = offset
-            storage.save_settings(s)
+            us = storage.load_settings(user_id)
+            us.timezone_offset = offset
+            storage.save_settings(us)
             await update.message.reply_text(f"✅ Часовой пояс: UTC+{offset}")
         except ValueError:
             await update.message.reply_text("❌ Введи число от -12 до 14")
@@ -692,7 +775,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("🔒 Доступ закрыт.")
         return
 
-    if q.data in ("clear_yes", "clear_no", "set_tz", "toggle_fonbet") and not auth.is_admin(user_id):
+    # Очистка списка — только админ
+    if q.data in ("clear_yes", "clear_no") and not auth.is_admin(user_id):
         await q.answer("⛔ Только админ.", show_alert=True)
         return
 
@@ -704,6 +788,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Отмена.")
 
     elif q.data == "set_tz":
+        # Персональная настройка — ключ по user_id
         PENDING_INPUT[(chat_id, user_id)] = "timezone"
         await q.edit_message_text(
             "🌐 Введи смещение UTC+N (`3` — Москва, `0` — UTC):",
@@ -711,7 +796,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
     elif q.data == "toggle_fonbet":
-        s = storage.load_settings(chat_id)
+        # Персональная настройка по user_id
+        s = storage.load_settings(user_id)
         s.fonbet_notifications = not s.fonbet_notifications
         storage.save_settings(s)
         fb_label = "✅ ВКЛ" if s.fonbet_notifications else "☐ ВЫКЛ"
@@ -720,7 +806,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(f"🔴 Уведомления Fonbet: {fb_label}", callback_data="toggle_fonbet")],
         ]
         await q.edit_message_text(
-            "⚙️ *Настройки*\n\nУведомления: за 30 и 5 минут.\nАвтоудаление: через 5 минут после старта.",
+            "⚙️ *Твои настройки*\n\n"
+            "🌐 Часовой пояс — для отображения времени матчей.\n"
+            "🔴 Уведомления Fonbet — получать ли сигналы о выходе матчей.\n\n"
+            "_Уведомления о матчах приходят за 30 и 5 минут до старта._",
             reply_markup=InlineKeyboardMarkup(kb),
             parse_mode="Markdown",
         )

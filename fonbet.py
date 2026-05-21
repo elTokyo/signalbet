@@ -177,6 +177,82 @@ def fetch_events() -> list[dict]:
     return result
 
 
+def dump_event_factors(pred_text: str) -> Optional[dict]:
+    """
+    Диагностика: находит матч из прогноза на Фонбете и возвращает
+    ВСЕ его факторы (коды рынков + коэффициенты) для определения кодов фор.
+
+    Возвращает: {team1, team2, is_live, factors: [{f: код, v: кэф, pt: параметр}, ...]}
+    или None если матч не найден.
+    """
+    host = get_working_host()
+    if not host:
+        return None
+
+    url = f"https://{host}{ENDPOINT_PATH}"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+    except Exception as e:
+        logger.error(f"dump_event_factors fetch error: {e}")
+        return None
+
+    # Находим нужный матч среди событий
+    pred_t1, pred_t2 = extract_teams_from_prediction(pred_text)
+    if not pred_t1:
+        return None
+
+    target_id = None
+    target_info = None
+    best_score = 0
+
+    p1 = pred_t1.lower()
+    p2 = pred_t2.lower() if pred_t2 else ""
+
+    for ev in data.get("events", []):
+        team1 = ev.get("team1") or ev.get("name1") or ""
+        team2 = ev.get("team2") or ev.get("name2") or ""
+        if not team1 or not team2:
+            continue
+        e1, e2 = team1.lower(), team2.lower()
+        if p2:
+            direct = (fuzz.token_sort_ratio(p1, e1) + fuzz.token_sort_ratio(p2, e2)) / 2
+            reverse = (fuzz.token_sort_ratio(p1, e2) + fuzz.token_sort_ratio(p2, e1)) / 2
+            score = max(direct, reverse)
+        else:
+            score = fuzz.token_sort_ratio(p1, e1)
+        if score > best_score:
+            best_score = score
+            target_id = ev.get("id")
+            target_info = {
+                "team1": team1,
+                "team2": team2,
+                "is_live": bool(ev.get("live") or ev.get("inLive") or ev.get("isLive")),
+            }
+
+    if not target_id or best_score < FUZZY_THRESHOLD:
+        return None
+
+    # Собираем ВСЕ факторы этого матча
+    all_factors = []
+    for entry in data.get("customFactors", []):
+        if entry.get("e") != target_id:
+            continue
+        for f in entry.get("factors", []):
+            all_factors.append({
+                "f": f.get("f"),    # код рынка
+                "v": f.get("v"),    # коэффициент
+                "pt": f.get("pt"),  # параметр (значение форы/тотала)
+                "p": f.get("p"),    # альтернативный параметр
+            })
+
+    target_info["factors"] = all_factors
+    target_info["match_score"] = round(best_score)
+    return target_info
+
+
 # ── Матчинг прогноза с событием ──────────────────────────────────────────────
 
 def extract_teams_from_prediction(text: str) -> tuple[str, str]:
