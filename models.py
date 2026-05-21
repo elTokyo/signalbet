@@ -5,15 +5,12 @@ import uuid
 
 @dataclass
 class Prediction:
-    text: str
-    match_time: datetime
+    text: str               # полная строка прогноза as-is
+    match_time: datetime    # время матча в UTC (naive)
     id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
     notified_30: bool = False
     notified_5: bool = False
-    # Fonbet
-    fonbet_notified_prematch: bool = False
-    fonbet_notified_live: bool = False
-    source: str = "manual"
+    source: str = "manual"  # "manual" | "discord"
 
     def to_dict(self) -> dict:
         return {
@@ -22,8 +19,6 @@ class Prediction:
             "match_time": self.match_time.isoformat(),
             "notified_30": self.notified_30,
             "notified_5": self.notified_5,
-            "fonbet_notified_prematch": self.fonbet_notified_prematch,
-            "fonbet_notified_live": self.fonbet_notified_live,
             "source": self.source,
         }
 
@@ -35,8 +30,6 @@ class Prediction:
             match_time=datetime.fromisoformat(d["match_time"]),
             notified_30=d.get("notified_30", False),
             notified_5=d.get("notified_5", False),
-            fonbet_notified_prematch=d.get("fonbet_notified_prematch", False),
-            fonbet_notified_live=d.get("fonbet_notified_live", False),
             source=d.get("source", "manual"),
         )
 
@@ -44,20 +37,11 @@ class Prediction:
 @dataclass
 class UserSettings:
     chat_id: int
-    timezone_offset: int = 3
-    fonbet_notifications: bool = True   # тумблер уведомлений Fonbet
+    timezone_offset: int = 3   # UTC+3 (Москва) по умолчанию
 
     def to_dict(self) -> dict:
-        return {
-            "chat_id": self.chat_id,
-            "timezone_offset": self.timezone_offset,
-            "fonbet_notifications": self.fonbet_notifications,
-        }
+        return {"chat_id": self.chat_id, "timezone_offset": self.timezone_offset}
 
     @classmethod
     def from_dict(cls, d: dict) -> "UserSettings":
-        return cls(
-            chat_id=d["chat_id"],
-            timezone_offset=d.get("timezone_offset", 3),
-            fonbet_notifications=d.get("fonbet_notifications", True),
-        )
+        return cls(chat_id=d["chat_id"], timezone_offset=d.get("timezone_offset", 3))

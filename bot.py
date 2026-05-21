@@ -37,16 +37,6 @@ def main():
     if not config.BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не задан")
 
-    # Диагностика конфигурации при старте
-    logger.info("=" * 50)
-    logger.info("Конфигурация бота:")
-    logger.info(f"  ACCESS_PASSWORD: {'✅ задан' if config.ACCESS_PASSWORD else '❌ НЕ ЗАДАН (бот пустит всех!)'}")
-    logger.info(f"  ADMIN_CHAT_IDS:  {config.ADMIN_CHAT_IDS or '❌ ПУСТО'}")
-    logger.info(f"  GITHUB_TOKEN:    {'✅ задан' if config.GITHUB_TOKEN else '❌ НЕ ЗАДАН'}")
-    logger.info(f"  GIST_ID:         {config.GIST_ID or '❌ НЕ ЗАДАН'}")
-    logger.info(f"  DISCORD:         {'✅ настроен' if config.DISCORD_TOKEN else 'отключён'}")
-    logger.info("=" * 50)
-
     if not config.ACCESS_PASSWORD:
         logger.warning("⚠️ ACCESS_PASSWORD не задан — бот открыт для всех!")
     if not config.ADMIN_CHAT_IDS:
@@ -63,16 +53,12 @@ def main():
     app.add_handler(CommandHandler("delete",   handlers.cmd_delete))
     app.add_handler(CommandHandler("clear",    handlers.cmd_clear))
     app.add_handler(CommandHandler("settings", handlers.cmd_settings))
-    app.add_handler(CommandHandler("feedback", handlers.cmd_feedback))
 
     # Админ-команды
-    app.add_handler(CommandHandler("users",     handlers.cmd_users))
-    app.add_handler(CommandHandler("ban",       handlers.cmd_ban))
-    app.add_handler(CommandHandler("unban",     handlers.cmd_unban))
-    app.add_handler(CommandHandler("remove",    handlers.cmd_remove))
-    app.add_handler(CommandHandler("debug",     handlers.cmd_debug))
-    app.add_handler(CommandHandler("broadcast", handlers.cmd_broadcast))
-    app.add_handler(CommandHandler("cancel",    handlers.cmd_cancel))
+    app.add_handler(CommandHandler("users",    handlers.cmd_users))
+    app.add_handler(CommandHandler("ban",      handlers.cmd_ban))
+    app.add_handler(CommandHandler("unban",    handlers.cmd_unban))
+    app.add_handler(CommandHandler("remove",   handlers.cmd_remove))
 
     # Кнопки + текст
     app.add_handler(CallbackQueryHandler(handlers.on_callback))

@@ -3,62 +3,50 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 from models import Prediction
 
-# Триггеры начала нового прогноза
-TRIGGERS = ("футбол.", "soccer.", "футбол ", "soccer ")
-
 
 def parse_predictions(text: str, tz_offset: int = 3, source: str = "manual") -> list[Prediction]:
     """
-    Парсер прогнозов:
-    1. Длинные тире (3+ подряд) разделяют блоки прогнозов на разное время
-    2. Внутри блока новый прогноз начинается со слов "Футбол" или "Soccer"
-    3. Каждый прогноз содержит время в формате HH-MM или HH:MM
+    Разбивает текст на блоки по пустым строкам — каждый блок = один прогноз.
+    Из блока вытаскивается только время (для планировщика), остальное сохраняется as-is.
+
+    Пример блока (любые 1-N строк):
+        Soccer. Brazil. Acreano U20. 2-00
+        Santa Cruz Acre U20 — Independencia FC U20
+        ф1-4,5
     """
-    normalized = text.replace('\r\n', '\n').replace('\r', '\n')
-
-    # Заменяем разделитель из тире на одинаковый маркер
-    normalized = re.sub(r'[-–—]{3,}', '\n', normalized)
-
-    # Склеиваем всё в одну строку через пробел, чтобы было удобно искать триггеры
-    flat = re.sub(r'\s+', ' ', normalized).strip()
-
-    # Разбиваем по триггерам, сохраняя их в начале каждого фрагмента
-    # Паттерн ищет "Футбол." или "Soccer." как начало (case-insensitive)
-    parts = re.split(r'(?i)(?=(?:футбол|soccer)[\.\s])', flat)
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    blocks = re.split(r"\n\s*\n", normalized.strip())
 
     predictions = []
-    for part in parts:
-        part = part.strip()
-        if not part:
+    for block in blocks:
+        block = block.strip()
+        if not block:
             continue
-        # Должен начинаться с триггера
-        if not part.lower().startswith(("футбол", "soccer")):
-            continue
-        pred = _parse_one(part, tz_offset, source)
+        pred = _parse_block(block, tz_offset, source)
         if pred:
             predictions.append(pred)
-
     return predictions
 
 
-def _parse_one(text: str, tz_offset: int, source: str) -> Optional[Prediction]:
-    """Парсит одну строку прогноза. Время обязательно."""
-    text = text.strip().rstrip('.')
+def _parse_block(block: str, tz_offset: int, source: str) -> Optional[Prediction]:
+    # Убираем нумерацию "1." / "1)" в самом начале блока
+    cleaned = re.sub(r"^\d+[\.\)]\s*", "", block.strip())
 
-    # Ищем первое валидное время: 18-00, 19:00, 2-30
+    # Склеиваем многострочный блок в одну строку через пробел
+    single_line = " ".join(line.strip() for line in cleaned.split("\n") if line.strip())
+
+    # Ищем первое валидное время: 2-00, 14:30
     hour = minute = None
-    time_pos = None
-    for m in re.finditer(r'\b(\d{1,2})[-:](\d{2})\b', text):
+    for m in re.finditer(r"\b(\d{1,2})[-:](\d{2})\b", single_line):
         h, mn = int(m.group(1)), int(m.group(2))
         if 0 <= h <= 23 and 0 <= mn <= 59:
             hour, minute = h, mn
-            time_pos = m
             break
 
     if hour is None:
         return None
 
-    # Конвертация локального времени → UTC
+    # Конвертируем локальное время пользователя → UTC
     user_tz = timezone(timedelta(hours=tz_offset))
     local_now = datetime.now(timezone.utc).astimezone(user_tz)
     today = local_now.date()
@@ -70,29 +58,25 @@ def _parse_one(text: str, tz_offset: int, source: str) -> Optional[Prediction]:
 
     match_time_utc = local_dt.astimezone(timezone.utc).replace(tzinfo=None)
 
-    # Если время уже прошло (с запасом 5 минут) — значит на завтра
+    # Если матч уже прошёл сегодня — значит на завтра
     utc_now = datetime.utcnow()
     if match_time_utc < utc_now - timedelta(minutes=5):
         match_time_utc += timedelta(days=1)
 
     return Prediction(
-        text=text,
+        text=single_line,
         match_time=match_time_utc,
         source=source,
     )
 
 
-def _local_time_str(pred: Prediction, tz_offset: int) -> str:
+def format_time_local(pred: Prediction, tz_offset: int) -> str:
     return (pred.match_time + timedelta(hours=tz_offset)).strftime("%H:%M")
 
 
 def format_prediction_line(pred: Prediction, tz_offset: int, index: int = None) -> str:
     num = f"{index}. " if index else ""
     return f"{num}{pred.text}"
-
-
-def format_time_local(pred: Prediction, tz_offset: int) -> str:
-    return _local_time_str(pred, tz_offset)
 
 
 def format_reminder(pred: Prediction, minutes_before: int) -> str:

@@ -1,9 +1,10 @@
 """
 Хранилище через GitHub Gist API.
-Кэш с TTL: чтения быстрые, но устаревают через CACHE_TTL секунд.
-Записи всегда инвалидируют кэш.
+Все данные (users, predictions, settings) хранятся в одном приватном Gist
+как три JSON-файла. Read-modify-write под локом для исключения race condition.
 """
 import json
+import os
 import logging
 import threading
 import time
@@ -23,25 +24,28 @@ HEADERS = {
     "X-GitHub-Api-Version": "2022-11-28",
 }
 
+# Имена файлов внутри Gist
 FILE_USERS       = "users.json"
 FILE_PREDICTIONS = "predictions.json"
 FILE_SETTINGS    = "settings.json"
 
-# Кэш живёт 10 секунд. За это время делается обычно <50 операций → 6 запросов/мин к Gist
-CACHE_TTL = 10
-
+# Глобальный лок (атомарность чтения-записи)
 _lock = threading.RLock()
+
+# Кэш содержимого Gist в памяти, чтобы не дёргать API на каждом чтении
 _cache: dict[str, dict] = {}
-_cache_time: dict[str, float] = {}
+_cache_loaded = False
 
 
 def _ensure_setup():
     if not GITHUB_TOKEN or not GIST_ID:
-        raise RuntimeError("GITHUB_TOKEN или GIST_ID не заданы")
+        raise RuntimeError(
+            "GITHUB_TOKEN или GIST_ID не заданы в переменных окружения"
+        )
 
 
 def _fetch_gist() -> dict:
-    """Скачивает все файлы Gist."""
+    """Скачивает все файлы Gist и возвращает {filename: parsed_json}."""
     _ensure_setup()
     url = f"{API_BASE}/gists/{GIST_ID}"
     for attempt in range(3):
@@ -55,25 +59,25 @@ def _fetch_gist() -> dict:
                     try:
                         result[name] = json.loads(content) if content.strip() else {}
                     except json.JSONDecodeError:
-                        logger.error(f"Gist file {name} corrupted")
+                        logger.error(f"Gist file {name} is corrupted, returning empty")
                         result[name] = {}
                 return result
             elif r.status_code == 404:
-                logger.error(f"Gist {GIST_ID} не найден")
+                logger.error(f"Gist {GIST_ID} не найден!")
                 return {}
             elif r.status_code in (401, 403):
-                logger.error(f"GitHub auth error: {r.status_code}")
+                logger.error(f"GitHub auth error: {r.status_code} {r.text}")
                 return {}
             else:
                 logger.warning(f"Gist fetch attempt {attempt+1}: {r.status_code}")
         except requests.RequestException as e:
-            logger.warning(f"Gist fetch error: {e}")
+            logger.warning(f"Gist fetch attempt {attempt+1} error: {e}")
         time.sleep(1 + attempt)
     return {}
 
 
 def _push_files(updates: dict[str, dict]):
-    """Загружает обновлённые файлы в Gist."""
+    """Загружает обновлённые файлы в Gist. updates = {filename: data_dict}."""
     _ensure_setup()
     url = f"{API_BASE}/gists/{GIST_ID}"
     payload = {
@@ -86,56 +90,52 @@ def _push_files(updates: dict[str, dict]):
         try:
             r = requests.patch(url, headers=HEADERS, json=payload, timeout=15)
             if r.status_code == 200:
-                logger.info(f"Gist обновлён: {list(updates.keys())}")
                 return True
-            logger.warning(f"Gist push {attempt+1}: {r.status_code} {r.text[:200]}")
+            logger.warning(f"Gist push attempt {attempt+1}: {r.status_code} {r.text[:200]}")
         except requests.RequestException as e:
-            logger.warning(f"Gist push error: {e}")
+            logger.warning(f"Gist push attempt {attempt+1} error: {e}")
         time.sleep(1 + attempt)
-    logger.error("Не удалось записать в Gist!")
+    logger.error("Не удалось записать в Gist после 3 попыток!")
     return False
 
 
+def _load_cache():
+    """При первом обращении подгружаем содержимое Gist в _cache."""
+    global _cache, _cache_loaded
+    if _cache_loaded:
+        return
+    files = _fetch_gist()
+    _cache = {
+        FILE_USERS:       files.get(FILE_USERS, {}) or {},
+        FILE_PREDICTIONS: files.get(FILE_PREDICTIONS, {}) or {},
+        FILE_SETTINGS:    files.get(FILE_SETTINGS, {}) or {},
+    }
+    _cache_loaded = True
+    logger.info(
+        f"Gist загружен: users={len(_cache[FILE_USERS])}, "
+        f"chats_with_preds={len(_cache[FILE_PREDICTIONS])}, "
+        f"settings={len(_cache[FILE_SETTINGS])}"
+    )
+
+
 def read(filename: str) -> dict:
-    """
-    Читает данные конкретного файла из Gist.
-    Использует кэш с TTL=10сек — баланс между скоростью и свежестью.
-    """
+    """Читает данные определённого файла из кэша."""
     with _lock:
-        now = time.time()
-        last_load = _cache_time.get(filename, 0)
-
-        if filename in _cache and (now - last_load) < CACHE_TTL:
-            return dict(_cache[filename])  # копия чтобы не мутировали
-
-        # Кэш протух или пустой — перезагружаем все файлы одним запросом
-        files = _fetch_gist()
-        _cache[FILE_USERS]       = files.get(FILE_USERS, {}) or {}
-        _cache[FILE_PREDICTIONS] = files.get(FILE_PREDICTIONS, {}) or {}
-        _cache[FILE_SETTINGS]    = files.get(FILE_SETTINGS, {}) or {}
-
-        now = time.time()
-        _cache_time[FILE_USERS]       = now
-        _cache_time[FILE_PREDICTIONS] = now
-        _cache_time[FILE_SETTINGS]    = now
-
-        return dict(_cache.get(filename, {}))
+        _load_cache()
+        return dict(_cache.get(filename, {}))   # копия чтоб не мутировали кэш
 
 
 def write(filename: str, data: dict):
-    """
-    Записывает данные. ВАЖНО: после записи инвалидирует кэш у всех инстансов
-    (через TTL=0) — следующее чтение в любом месте подтянет свежие данные.
-    """
+    """Записывает данные в кэш и пушит в Gist."""
     with _lock:
-        _push_files({filename: data})
-        # Обновляем локальный кэш
+        _load_cache()
         _cache[filename] = data
-        _cache_time[filename] = time.time()
+        _push_files({filename: data})
 
 
-def invalidate_cache():
-    """Принудительно сбросить кэш — чтобы следующее чтение пошло в Gist."""
+def refresh_cache():
+    """Принудительно перечитать Gist (на случай если данные меняли вручную)."""
+    global _cache_loaded
     with _lock:
-        _cache_time.clear()
-        _cache.clear()
+        _cache_loaded = False
+        _load_cache()
