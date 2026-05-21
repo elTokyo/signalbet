@@ -23,6 +23,79 @@ logger = logging.getLogger(__name__)
 RECHECK_INTERVAL_SEC = 15 * 60   # перечит раз в 15 минут
 RECHECK_HISTORY_LIMIT = 15       # сколько последних сообщений перечитывать
 
+# Ссылки на работающий Discord-клиент и его event loop —
+# нужны чтобы вызвать перечит из другого потока (Telegram-команда /syncdiscord)
+_client_ref: discord.Client | None = None
+_loop_ref = None
+
+
+def trigger_manual_recheck() -> tuple[bool, str]:
+    """
+    Вызывается из Telegram-потока (команда /syncdiscord).
+    Планирует перечит канала в Discord event loop.
+    Возвращает (успех, сообщение).
+    """
+    if _client_ref is None or _loop_ref is None:
+        return False, "Discord-бот не запущен (проверь DISCORD_TOKEN)"
+
+    if _client_ref.is_closed():
+        return False, "Discord-соединение закрыто"
+
+    try:
+        # Планируем корутину в loop Discord-потока
+        future = asyncio.run_coroutine_threadsafe(_manual_recheck(), _loop_ref)
+        count = future.result(timeout=30)   # ждём результат до 30 сек
+        return True, f"Проверено сообщений: {count}"
+    except Exception as e:
+        logger.error(f"Manual recheck error: {e}")
+        return False, f"Ошибка: {e}"
+
+
+async def _manual_recheck() -> int:
+    """Перечитывает последние сообщения канала. Возвращает кол-во проверенных."""
+    ch = _client_ref.get_channel(config.DISCORD_CHANNEL_ID)
+    if not ch:
+        raise RuntimeError("канал не найден")
+
+    count = 0
+    async for msg in ch.history(limit=RECHECK_HISTORY_LIMIT):
+        if msg.author == _client_ref.user:
+            continue
+        await _process_static(msg.content, "manual")
+        count += 1
+    return count
+
+
+async def _process_static(content: str, origin: str):
+    """Версия process_message_text доступная вне замыкания (для manual recheck)."""
+    preds = parse_predictions(content, config.DEFAULT_TZ_OFFSET, source="discord")
+    if not preds:
+        return
+    added = storage.add_predictions(new_preds=preds)
+    if added <= 0:
+        return
+    logger.info(f"Discord [{origin}]: добавлено {added} новых прогнозов")
+    recipients = storage.get_all_recipient_chat_ids()
+    if not recipients:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            for chat_id in recipients:
+                s = storage.load_settings(chat_id)
+                lines = [f"🤖 Из Discord: +{added} прогнозов"]
+                for p in preds[-added:]:
+                    t = format_time_local(p, s.timezone_offset)
+                    lines.append(f"⏰ {t}  {p.text}")
+                try:
+                    await session.post(
+                        f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendMessage",
+                        json={"chat_id": chat_id, "text": "\n".join(lines)},
+                    )
+                except Exception as e:
+                    logger.error(f"TG send to {chat_id} failed: {e}")
+    except Exception as e:
+        logger.error(f"Discord broadcast error: {e}")
+
 
 def run_discord_listener():
     if not config.DISCORD_TOKEN or not config.DISCORD_CHANNEL_ID:
@@ -33,41 +106,6 @@ def run_discord_listener():
     intents.message_content = True
 
     client = discord.Client(intents=intents)
-
-    # ── Общая обработка текста сообщения ─────────────────────────────────────
-    async def process_message_text(content: str, origin: str):
-        """Парсит текст, добавляет новые прогнозы, рассылает уведомление."""
-        preds = parse_predictions(content, config.DEFAULT_TZ_OFFSET, source="discord")
-        if not preds:
-            return
-
-        added = storage.add_predictions(new_preds=preds)
-        if added <= 0:
-            return  # все прогнозы уже были (дубли)
-
-        logger.info(f"Discord [{origin}]: добавлено {added} новых прогнозов")
-
-        recipients = storage.get_all_recipient_chat_ids()
-        if not recipients:
-            return
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                for chat_id in recipients:
-                    s = storage.load_settings(chat_id)
-                    lines = [f"🤖 Из Discord: +{added} прогнозов"]
-                    for p in preds[-added:]:
-                        t = format_time_local(p, s.timezone_offset)
-                        lines.append(f"⏰ {t}  {p.text}")
-                    try:
-                        await session.post(
-                            f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendMessage",
-                            json={"chat_id": chat_id, "text": "\n".join(lines)},
-                        )
-                    except Exception as e:
-                        logger.error(f"TG send to {chat_id} failed: {e}")
-        except Exception as e:
-            logger.error(f"Discord broadcast error: {e}")
 
     # ── Периодический перечит последних сообщений ────────────────────────────
     async def periodic_recheck():
@@ -84,7 +122,7 @@ def run_discord_listener():
                 async for msg in ch.history(limit=RECHECK_HISTORY_LIMIT):
                     if msg.author == client.user:
                         continue
-                    await process_message_text(msg.content, "recheck")
+                    await _process_static(msg.content, "recheck")
                     count += 1
                 logger.info(f"Discord periodic recheck: проверено {count} сообщений")
             except Exception as e:
@@ -93,13 +131,15 @@ def run_discord_listener():
     # ── События ──────────────────────────────────────────────────────────────
     @client.event
     async def on_ready():
+        global _client_ref, _loop_ref
+        _client_ref = client
+        _loop_ref = client.loop
         logger.info(f"Discord listener запущен: {client.user}")
         ch = client.get_channel(config.DISCORD_CHANNEL_ID)
         if ch:
             logger.info(f"Слушаю канал: #{ch.name}")
         else:
             logger.error(f"Канал {config.DISCORD_CHANNEL_ID} не найден")
-        # Запускаем фоновый перечит
         client.loop.create_task(periodic_recheck())
 
     @client.event
@@ -108,7 +148,7 @@ def run_discord_listener():
             return
         if message.channel.id != config.DISCORD_CHANNEL_ID:
             return
-        await process_message_text(message.content, "new")
+        await _process_static(message.content, "new")
 
     @client.event
     async def on_message_edit(before: discord.Message, after: discord.Message):
@@ -116,10 +156,9 @@ def run_discord_listener():
             return
         if after.channel.id != config.DISCORD_CHANNEL_ID:
             return
-        # Текст не изменился — игнорируем (могло быть изменение эмбеда/реакции)
         if before.content == after.content:
             return
         logger.info("Discord: обнаружено редактирование сообщения")
-        await process_message_text(after.content, "edit")
+        await _process_static(after.content, "edit")
 
     client.run(config.DISCORD_TOKEN, log_handler=None)

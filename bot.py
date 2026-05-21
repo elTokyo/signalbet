@@ -72,6 +72,7 @@ def main():
     app.add_handler(CommandHandler("remove",    handlers.cmd_remove))
     app.add_handler(CommandHandler("debug",     handlers.cmd_debug))
     app.add_handler(CommandHandler("checkfonbet", handlers.cmd_checkfonbet))
+    app.add_handler(CommandHandler("syncdiscord", handlers.cmd_syncdiscord))
     app.add_handler(CommandHandler("broadcast", handlers.cmd_broadcast))
     app.add_handler(CommandHandler("cancel",    handlers.cmd_cancel))
 

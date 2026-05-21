@@ -536,6 +536,29 @@ async def cmd_checkfonbet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
+@require_admin
+async def cmd_syncdiscord(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Принудительно перечитать Discord-канал на новые прогнозы."""
+    if not config.DISCORD_TOKEN:
+        await update.message.reply_text("⚠️ Discord не настроен (нет DISCORD_TOKEN).")
+        return
+
+    msg = await update.message.reply_text("🔄 Перечитываю Discord-канал...")
+
+    try:
+        import discord_listener
+        ok, info = discord_listener.trigger_manual_recheck()
+    except Exception as e:
+        logger.exception(f"/syncdiscord error: {e}")
+        await msg.edit_text(f"❌ Ошибка: {e}")
+        return
+
+    if ok:
+        await msg.edit_text(f"✅ Готово. {info}\n\nНовые прогнозы (если были) уже добавлены.")
+    else:
+        await msg.edit_text(f"❌ {info}")
+
+
 # ── Обработка текста ─────────────────────────────────────────────────────────
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
