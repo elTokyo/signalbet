@@ -585,7 +585,14 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if mode == "predictions":
         if not auth.is_admin(user_id):
             return
-        preds = parse_predictions(update.message.text, s.timezone_offset, source="manual")
+        try:
+            preds = parse_predictions(update.message.text, s.timezone_offset, source="manual")
+            logger.info(f"/add: распознано {len(preds)} прогнозов от {user_id}")
+        except Exception as e:
+            logger.exception(f"/add parse error: {e}")
+            await update.message.reply_text(f"❌ Ошибка разбора: {e}")
+            return
+
         if not preds:
             await update.message.reply_text(
                 "❌ Не нашёл время матча. Формат: `2-00` или `14:30`",
@@ -593,29 +600,44 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        added = storage.add_predictions(new_preds=preds)
+        try:
+            added = storage.add_predictions(new_preds=preds)
+            logger.info(f"/add: добавлено {added} в хранилище")
+        except Exception as e:
+            logger.exception(f"/add storage error: {e}")
+            await update.message.reply_text(f"❌ Ошибка сохранения: {e}")
+            return
+
         skipped = len(preds) - added
-        lines = [f"✅ *Добавлено: {added}*" + (f"  (дублей: {skipped})" if skipped else "")]
+        lines = [f"✅ Добавлено: {added}" + (f"  (дублей: {skipped})" if skipped else "")]
         for i, p in enumerate(preds, 1):
             t = format_time_local(p, s.timezone_offset)
             lines.append(f"\n{i}. ⏰ {t}\n   {p.text}")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+        # Без Markdown — названия команд могут содержать спецсимволы (_ * [ ])
+        try:
+            await update.message.reply_text("\n".join(lines))
+        except Exception as e:
+            logger.exception(f"/add reply error: {e}")
 
         # Broadcast другим авторизованным пользователям (кроме того кто добавил)
         if added > 0:
-            recipients = storage.get_all_recipient_chat_ids()
-            for rid in recipients:
-                if rid == chat_id:
-                    continue  # тот кто добавил уже видит сообщение
-                try:
-                    rs = storage.load_settings(rid)
-                    rlines = [f"📥 Админ добавил +{added} прогнозов"]
-                    for p in preds[-added:]:
-                        t = format_time_local(p, rs.timezone_offset)
-                        rlines.append(f"⏰ {t}  {p.text}")
-                    await ctx.bot.send_message(chat_id=rid, text="\n".join(rlines))
-                except Exception as e:
-                    logger.error(f"broadcast add to {rid} failed: {e}")
+            try:
+                recipients = storage.get_all_recipient_chat_ids()
+                for rid in recipients:
+                    if rid == chat_id:
+                        continue
+                    try:
+                        rs = storage.load_settings(rid)
+                        rlines = [f"📥 Админ добавил +{added} прогнозов"]
+                        for p in preds[-added:]:
+                            t = format_time_local(p, rs.timezone_offset)
+                            rlines.append(f"⏰ {t}  {p.text}")
+                        await ctx.bot.send_message(chat_id=rid, text="\n".join(rlines))
+                    except Exception as e:
+                        logger.error(f"broadcast add to {rid} failed: {e}")
+            except Exception as e:
+                logger.exception(f"/add broadcast error: {e}")
         return
 
 
