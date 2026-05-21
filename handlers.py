@@ -518,6 +518,12 @@ async def cmd_checkfonbet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text = text[:4000] + "\n\n... (список обрезан)"
 
     await msg.edit_text(text)
+
+
+# ── Обработка текста ─────────────────────────────────────────────────────────
+
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     user = update.effective_user
     user_id = user.id
     key = (chat_id, user_id)
