@@ -1,16 +1,20 @@
 # ⚽ Bet Bot v2
 
-Telegram-бот для прогнозов на матчи: напоминания, авто-парсинг из Discord, ролевой доступ.
+Telegram-бот для футбольных прогнозов: напоминания, парсинг Discord, мониторинг Fonbet, ролевой доступ.
 
 ## Возможности
 
-- 📥 **Ручное добавление** прогнозов через `/add`
 - 🤖 **Авто-парсинг** прогнозов из Discord-канала
-- 🔔 **Уведомления** за 30 и 5 минут до матча
-- 🗑 **Автоудаление** через 5 минут после старта матча
-- 🔒 **Авторизация по паролю** + whitelist пользователей
-- 👥 **Роли**: админы добавляют/удаляют, юзеры только смотрят
-- 💾 **Хранение в GitHub Gist** — данные не пропадают при редеплое
+- 📥 **Ручное добавление** через `/add` (админы)
+- 🔔 **Напоминания** за 30 и 5 минут до матча
+- 🔴 **Мониторинг Fonbet** — уведомление когда матч вышел в прематч/лайв + коэффициенты
+- 🗑 **Автоудаление** через 5 минут после старта
+- 🔒 **Авторизация по паролю** + whitelist
+- 👥 **Роли**: админы управляют, юзеры только смотрят
+- 📢 **Рассылка** всем юзерам (`/broadcast`)
+- 📨 **Обратная связь** от юзеров (`/feedback`)
+- 💾 **Хранение в GitHub Gist** — данные переживают редеплои
+- 📋 **Общий список** прогнозов для всех пользователей
 
 ---
 
@@ -22,64 +26,53 @@ Telegram-бот для прогнозов на матчи: напоминани�
 |---|---|---|
 | `BOT_TOKEN` | Токен TG-бота | [@BotFather](https://t.me/BotFather) |
 | `ACCESS_PASSWORD` | Пароль для доступа | Придумай сам |
-| `ADMIN_CHAT_IDS` | ID админов через запятую: `123,456,789` | [@userinfobot](https://t.me/userinfobot) |
+| `ADMIN_CHAT_IDS` | ID админов через запятую: `123,456` | [@userinfobot](https://t.me/userinfobot) |
 | `GITHUB_TOKEN` | Токен GitHub с правом `gist` | [github.com/settings/tokens](https://github.com/settings/tokens) |
-| `GIST_ID` | ID приватного Gist'а с `users.json` | URL твоего Gist |
+| `GIST_ID` | ID приватного Gist | URL твоего Gist |
 
-### Опциональные (для авто-парсинга Discord)
+### Опциональные — Discord
 
 | Переменная | Описание |
 |---|---|
 | `DISCORD_TOKEN` | Токен Discord-бота |
 | `DISCORD_CHANNEL_ID` | ID текстового канала с прогнозами |
-| `DISCORD_TARGET_TG_CHAT_ID` | TG chat_id куда пушить (личка или группа) |
 
 ### Дополнительные
 
 | Переменная | По умолчанию | Описание |
 |---|---|---|
-| `DEFAULT_TZ_OFFSET` | `3` | Часовой пояс UTC+N для новых пользователей |
-
----
-
-## Настройка GitHub Gist (для хранения)
-
-1. Открой https://gist.github.com
-2. Filename: `users.json`, body: `{}`
-3. Нажми **Create secret gist**
-4. Скопируй ID из URL: `gist.github.com/user/<ID_ТУТ>`
-5. Создай токен на https://github.com/settings/tokens (Classic) с правом `gist`
-6. Добавь `GITHUB_TOKEN` и `GIST_ID` в Railway
-
-Бот сам создаст файлы `predictions.json` и `settings.json` внутри этого Gist при первой записи.
+| `DEFAULT_TZ_OFFSET` | `3` | Часовой пояс UTC+N |
 
 ---
 
 ## Команды
 
 ### Для всех авторизованных
-- `/start` — начало работы / запрос пароля
+- `/start` — начало / запрос пароля
 - `/list` — список активных прогнозов
+- `/feedback` — отправить отзыв или баг-репорт админу
 
 ### Только для админов
 - `/add` — добавить прогнозы
 - `/delete <id>` — удалить один
 - `/clear` — очистить все
-- `/settings` — настройки (часовой пояс)
-- `/users` — список авторизованных пользователей
-- `/ban <user_id>` — забанить
-- `/unban <user_id>` — разбанить
-- `/remove <user_id>` — удалить из whitelist
+- `/settings` — настройки (часовой пояс, тумблер Fonbet)
+- `/broadcast` — рассылка всем пользователям
+- `/users` — список авторизованных
+- `/ban <id>` / `/unban <id>` / `/remove <id>` — управление доступом
+- `/debug` — диагностика конфигурации
+- `/cancel` — отмена текущего ввода
 
 ---
 
-## Работа в группе
+## Настройка GitHub Gist
 
-1. Добавь бота в группу
-2. BotFather → твой бот → Bot Settings → **Group Privacy → Turn off**
-3. Сделай бота админом группы
-4. Уведомления будут приходить в группу автоматически
-5. Юзеры группы видят `/list`, добавляют только админы
+1. https://gist.github.com → filename `users.json`, body `{}` → **Create secret gist**
+2. Скопируй ID из URL: `gist.github.com/user/<ID>`
+3. https://github.com/settings/tokens → Generate (classic) с правом `gist`
+4. Добавь `GITHUB_TOKEN` и `GIST_ID` в Railway
+
+Файлы `predictions.json` и `settings.json` бот создаст сам.
 
 ---
 
@@ -87,38 +80,61 @@ Telegram-бот для прогнозов на матчи: напоминани�
 
 1. https://discord.com/developers/applications → New Application
 2. Bot → Reset Token → скопировать
-3. **Включи Message Content Intent!** (без него бот не видит текст)
-4. OAuth2 → URL Generator → bot + права `View Channel`, `Read Message History`
+3. **Включи Message Content Intent!**
+4. OAuth2 → URL Generator → bot + `View Channel`, `Read Message History`
 5. Перейди по ссылке → добавь на сервер
+
+---
+
+## Работа в группе
+
+1. Добавь бота в группу
+2. BotFather → Bot Settings → **Group Privacy → Turn off**
+3. Сделай бота админом группы
+4. Уведомления приходят в группу, юзеры видят `/list`, добавляют админы
 
 ---
 
 ## Формат прогнозов
 
-Главное — наличие времени `HH-MM` или `HH:MM` в тексте. Несколько прогнозов отделяй пустой строкой:
+Триггер начала прогноза — слово **Футбол** или **Soccer**. Блоки на разное время
+разделяются длинными тире (`-------`). Несколько прогнозов на одно время идут подряд.
 
 ```
-Soccer. Brazil. Acreano U20. 2-00
-Santa Cruz Acre U20 — Independencia FC U20
-ф1-4,5
-
-Soccer. Australia. 11-00
-Hurstville U20 — Mariners U20 п2 4+
+Футбол. Нигерия. Кубок. 18-00 Эль-Шама — Эньимба п2 3+
+-------------------------------
+Футбол. Польша. 19-00 Уния — Спуйня п2 4+
+Футбол. Чехия. 19-00 Пенчин — Коштялов ф1-4,5
 ```
+
+Бот вытащит время для планировщика, остальной текст сохранит как есть.
+
+---
+
+## Мониторинг Fonbet
+
+- Окно проверки: за 60 мин до старта → +20 мин после
+- Проверка каждые 60 секунд (автодетект URL + fallback)
+- Fuzzy-сопоставление команд (порог 75%)
+- Уведомления о прематч и лайв с коэффициентами П1/П2
+- Тумблер в `/settings` — каждый юзер включает/выключает сам
 
 ---
 
 ## Файловая структура
 
 ```
-bot.py              ← точка входа
-config.py           ← все переменные окружения
-auth.py             ← авторизация
-storage.py          ← прогнозы и настройки
-gist_storage.py     ← бэкенд GitHub Gist (общий)
-handlers.py         ← все команды TG
-parser.py           ← разбор прогнозов
-scheduler.py        ← напоминания + автоудаление
+bot.py              ← точка входа, регистрация команд
+config.py           ← переменные окружения
 models.py           ← Prediction, UserSettings
+parser.py           ← разбор прогнозов
+auth.py             ← авторизация и whitelist
+storage.py          ← прогнозы и настройки (общий список)
+gist_storage.py     ← бэкенд GitHub Gist
+handlers.py         ← все команды и обработка текста
+scheduler.py        ← напоминания + автоудаление + Fonbet
+fonbet.py           ← клиент Fonbet API, fuzzy-матчинг
 discord_listener.py ← авто-парсинг из Discord
+requirements.txt    ← зависимости
+Dockerfile          ← для деплоя
 ```
