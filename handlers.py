@@ -445,79 +445,95 @@ async def cmd_checkfonbet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     Тест парсера Fonbet: запрашивает события прямо сейчас и сверяет
     с текущим списком прогнозов. Показывает что найдено, что нет.
     """
-    import fonbet
+    logger.info(f"/checkfonbet вызвана пользователем {update.effective_user.id}")
 
-    msg = await update.message.reply_text("🔄 Запрашиваю Fonbet...")
-
-    # 1. Проверяем что URL находится
-    host = fonbet.get_working_host()
-    if not host:
-        await msg.edit_text(
-            "❌ Не удалось найти рабочий URL Fonbet.\n"
-            "Ни автодетект, ни fallback-хосты не ответили.\n"
-            "Возможно Fonbet недоступен или сменил адреса."
-        )
+    try:
+        import fonbet
+    except Exception as e:
+        logger.exception(f"/checkfonbet: не удалось импортировать fonbet: {e}")
+        await update.message.reply_text(f"❌ Модуль fonbet не загружен: {e}")
         return
 
-    # 2. Получаем события
-    events = fonbet.fetch_events()
-    if not events:
-        await msg.edit_text(
-            f"⚠️ URL найден (`{host}`), но события не получены.\n"
-            "Возможно изменился формат API.",
-        )
+    try:
+        msg = await update.message.reply_text("🔄 Запрашиваю Fonbet...")
+    except Exception as e:
+        logger.exception(f"/checkfonbet: ошибка отправки: {e}")
         return
 
-    # 3. Сверяем с прогнозами
-    predictions = storage.load_predictions()
-    if not predictions:
-        await msg.edit_text(
-            f"✅ Fonbet работает!\n"
-            f"Хост: `{host}`\n"
-            f"Получено событий: {len(events)}\n\n"
-            f"📋 Но список прогнозов пуст — добавь через /add чтобы проверить матчинг.",
-            parse_mode="Markdown",
-        )
-        return
-
-    lines = [
-        f"✅ Fonbet работает!",
-        f"Хост: {host}",
-        f"Событий получено: {len(events)}",
-        f"Прогнозов в списке: {len(predictions)}",
-        "",
-        "── Результаты матчинга ──",
-    ]
-
-    found_count = 0
-    for pred in predictions:
-        team1, team2 = fonbet.extract_teams_from_prediction(pred.text)
-        event = fonbet.find_matching_event(pred.text, events)
-
-        if event:
-            found_count += 1
-            status = "🔴 LIVE" if event["is_live"] else "📋 Прематч"
-            odds = ""
-            if event.get("odd_p1") or event.get("odd_p2"):
-                p1 = f"{event['odd_p1']:.2f}" if event.get("odd_p1") else "—"
-                p2 = f"{event['odd_p2']:.2f}" if event.get("odd_p2") else "—"
-                odds = f" (П1 {p1} / П2 {p2})"
-            lines.append(
-                f"\n✅ {status}{odds}\n"
-                f"   Прогноз: {team1} — {team2}\n"
-                f"   Fonbet: {event['team1']} — {event['team2']}"
+    try:
+        # 1. Проверяем что URL находится
+        host = fonbet.get_working_host()
+        if not host:
+            await msg.edit_text(
+                "❌ Не удалось найти рабочий URL Fonbet.\n"
+                "Ни автодетект, ни fallback-хосты не ответили."
             )
-        else:
-            lines.append(f"\n❌ Не найден: {team1} — {team2}")
+            return
 
-    lines.append(f"\n\n📊 Итого найдено: {found_count} из {len(predictions)}")
+        # 2. Получаем события
+        events = fonbet.fetch_events()
+        if not events:
+            await msg.edit_text(
+                f"⚠️ URL найден ({host}), но события не получены.\n"
+                "Возможно изменился формат API."
+            )
+            return
 
-    text = "\n".join(lines)
-    # Telegram лимит 4096 символов — обрезаем если надо
-    if len(text) > 4000:
-        text = text[:4000] + "\n\n... (список обрезан)"
+        # 3. Сверяем с прогнозами
+        predictions = storage.load_predictions()
+        if not predictions:
+            await msg.edit_text(
+                f"✅ Fonbet работает!\n"
+                f"Хост: {host}\n"
+                f"Получено событий: {len(events)}\n\n"
+                f"📋 Список прогнозов пуст — добавь через /add чтобы проверить матчинг."
+            )
+            return
 
-    await msg.edit_text(text)
+        lines = [
+            f"✅ Fonbet работает!",
+            f"Хост: {host}",
+            f"Событий получено: {len(events)}",
+            f"Прогнозов в списке: {len(predictions)}",
+            "",
+            "── Результаты матчинга ──",
+        ]
+
+        found_count = 0
+        for pred in predictions:
+            team1, team2 = fonbet.extract_teams_from_prediction(pred.text)
+            event = fonbet.find_matching_event(pred.text, events)
+
+            if event:
+                found_count += 1
+                status = "🔴 LIVE" if event["is_live"] else "📋 Прематч"
+                odds = ""
+                if event.get("odd_p1") or event.get("odd_p2"):
+                    p1 = f"{event['odd_p1']:.2f}" if event.get("odd_p1") else "—"
+                    p2 = f"{event['odd_p2']:.2f}" if event.get("odd_p2") else "—"
+                    odds = f" (П1 {p1} / П2 {p2})"
+                lines.append(
+                    f"\n✅ {status}{odds}\n"
+                    f"   Прогноз: {team1} — {team2}\n"
+                    f"   Fonbet: {event['team1']} — {event['team2']}"
+                )
+            else:
+                lines.append(f"\n❌ Не найден: {team1} — {team2}")
+
+        lines.append(f"\n\n📊 Итого найдено: {found_count} из {len(predictions)}")
+
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:4000] + "\n\n... (список обрезан)"
+
+        await msg.edit_text(text)
+
+    except Exception as e:
+        logger.exception(f"/checkfonbet: ошибка выполнения: {e}")
+        try:
+            await msg.edit_text(f"❌ Ошибка: {e}")
+        except Exception:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
 # ── Обработка текста ─────────────────────────────────────────────────────────
