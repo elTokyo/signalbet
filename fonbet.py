@@ -165,6 +165,8 @@ def fetch_events() -> list[dict]:
         if not team1 or not team2:
             continue
         events_map[ev.get("id")] = {
+            "id": ev.get("id"),
+            "parent_id": ev.get("parentId") or ev.get("parent"),
             "team1": team1,
             "team2": team2,
             "is_live": bool(ev.get("live") or ev.get("inLive") or ev.get("isLive")),
@@ -364,6 +366,21 @@ def find_matching_event(pred_text: str, events: list[dict]) -> Optional[dict]:
 import re as _re
 
 
+def build_match_url(event: dict) -> str:
+    """
+    Собирает ссылку на матч на сайте Фонбета.
+    Формат с лигой: fon.bet/sports/football/{parentId}/{id}
+    Упрощённый: fon.bet/sports/football/{id}
+    """
+    eid = event.get("id")
+    parent = event.get("parent_id")
+    if not eid:
+        return "https://fon.bet/"
+    if parent:
+        return f"https://fon.bet/sports/football/{parent}/{eid}"
+    return f"https://fon.bet/sports/football/{eid}"
+
+
 def parse_bet_from_prediction(text: str) -> Optional[dict]:
     """
     Извлекает тип ставки и порог из текста прогноза.
@@ -514,4 +531,5 @@ def check_crookedness(pred_text: str, event: dict) -> Optional[dict]:
         "is_live": event["is_live"],
         "reason": reason,
         "odds_info": odds_info,
+        "url": build_match_url(event),
     }

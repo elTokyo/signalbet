@@ -3,12 +3,16 @@ from datetime import datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from telegram.ext import Application
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 import storage
 import config
 import auth
 from parser import format_reminder
-from fonbet import fetch_events, find_matching_event, extract_teams_from_prediction, check_crookedness
+from fonbet import (
+    fetch_events, find_matching_event, extract_teams_from_prediction,
+    check_crookedness, build_match_url,
+)
 
 logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler()
@@ -126,6 +130,7 @@ async def fonbet_tick(app: Application):
         # Берём названия команд из ПРОГНОЗА (как просил)
         team1, team2 = extract_teams_from_prediction(pred.text)
         odds_line = _format_odds(event.get("odd_p1"), event.get("odd_p2"))
+        match_url = build_match_url(event)
 
         if event["is_live"] and not pred.fonbet_notified_live:
             msg = (
@@ -133,7 +138,7 @@ async def fonbet_tick(app: Application):
                 f"{team1} — {team2}\n"
                 f"{odds_line}"
             )
-            await _broadcast(app, recipients, msg)
+            await _broadcast(app, recipients, msg, url=match_url)
             pred.fonbet_notified_live = True
             # Раз дошли до live — prematch тоже больше не нужен
             pred.fonbet_notified_prematch = True
@@ -146,7 +151,7 @@ async def fonbet_tick(app: Application):
                 f"{team1} — {team2}\n"
                 f"{odds_line}"
             )
-            await _broadcast(app, recipients, msg)
+            await _broadcast(app, recipients, msg, url=match_url)
             pred.fonbet_notified_prematch = True
             changed = True
             logger.info(f"[fonbet prematch] {team1} — {team2}")
@@ -162,7 +167,7 @@ async def fonbet_tick(app: Application):
                     f"⚡ {crooked['reason']}\n"
                     f"{crooked['odds_info']}"
                 )
-                await _broadcast(app, recipients, msg)
+                await _broadcast(app, recipients, msg, url=crooked.get("url"))
                 pred.crooked_notified = True
                 changed = True
                 logger.info(f"[fonbet CROOKED] {team1} — {team2}: {crooked['reason']}")
@@ -182,9 +187,13 @@ def _format_odds(odd_p1, odd_p2) -> str:
 
 # ── Утилита broadcast ────────────────────────────────────────────────────────
 
-async def _broadcast(app: Application, chat_ids: list[int], text: str):
+async def _broadcast(app: Application, chat_ids: list[int], text: str, url: str = None):
+    """Отправляет сообщение всем получателям. Если задан url — добавляет кнопку."""
+    markup = None
+    if url:
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Открыть на Фонбете", url=url)]])
     for chat_id in chat_ids:
         try:
-            await app.bot.send_message(chat_id=chat_id, text=text)
+            await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
         except Exception as e:
             logger.error(f"send_message {chat_id} failed: {e}")
