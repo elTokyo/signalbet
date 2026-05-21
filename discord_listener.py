@@ -11,6 +11,7 @@ Discord-бот: слушает текстовый канал, парсит со�
 """
 import asyncio
 import logging
+from datetime import datetime, timezone, timedelta
 import discord
 import aiohttp
 
@@ -27,6 +28,28 @@ RECHECK_HISTORY_LIMIT = 15       # сколько последних сообщ�
 # нужны чтобы вызвать перечит из другого потока (Telegram-команда /syncdiscord)
 _client_ref: discord.Client | None = None
 _loop_ref = None
+
+
+def _is_from_today(message: discord.Message) -> bool:
+    """
+    True если сообщение создано ИЛИ отредактировано сегодня (по локальной дате).
+    Прогнозы публикуются строго на сегодня, поэтому вчерашние неубранные
+    сообщения должны игнорироваться, а отредактированные сегодня — обрабатываться.
+    """
+    tz = timezone(timedelta(hours=config.DEFAULT_TZ_OFFSET))
+    today = datetime.now(tz).date()
+
+    # created_at и edited_at в discord.py — timezone-aware UTC
+    created = message.created_at.astimezone(tz).date()
+    if created == today:
+        return True
+
+    if message.edited_at is not None:
+        edited = message.edited_at.astimezone(tz).date()
+        if edited == today:
+            return True
+
+    return False
 
 
 def trigger_manual_recheck() -> tuple[bool, str]:
@@ -61,6 +84,8 @@ async def _manual_recheck() -> int:
     async for msg in ch.history(limit=RECHECK_HISTORY_LIMIT):
         if msg.author == _client_ref.user:
             continue
+        if not _is_from_today(msg):
+            continue  # пропускаем вчерашние неубранные прогнозы
         await _process_static(msg.content, "manual")
         count += 1
     return count
@@ -122,6 +147,8 @@ def run_discord_listener():
                 async for msg in ch.history(limit=RECHECK_HISTORY_LIMIT):
                     if msg.author == client.user:
                         continue
+                    if not _is_from_today(msg):
+                        continue
                     await _process_static(msg.content, "recheck")
                     count += 1
                 logger.info(f"Discord periodic recheck: проверено {count} сообщений")
@@ -147,6 +174,8 @@ def run_discord_listener():
         if message.author == client.user:
             return
         if message.channel.id != config.DISCORD_CHANNEL_ID:
+            return
+        if not _is_from_today(message):
             return
         await _process_static(message.content, "new")
 
