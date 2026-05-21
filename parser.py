@@ -70,10 +70,26 @@ def _parse_one(text: str, tz_offset: int, source: str) -> Optional[Prediction]:
 
     match_time_utc = local_dt.astimezone(timezone.utc).replace(tzinfo=None)
 
-    # Если время уже прошло (с запасом 5 минут) — значит на завтра
+    # Логика выбора дня:
+    # - Если матч уже начался (время в прошлом) — это сыгранный матч, ИГНОРИРУЕМ его.
+    #   Возвращаем None, чтобы старые прогнозы из неубранного DC-канала не добавлялись.
+    # - Исключение: матчи поздней ночью (0:00–5:59), добавленные вечером, относятся
+    #   к завтрашнему дню. Их переносим на +1 день.
     utc_now = datetime.utcnow()
-    if match_time_utc < utc_now - timedelta(minutes=5):
-        match_time_utc += timedelta(days=1)
+
+    if match_time_utc < utc_now - timedelta(minutes=2):
+        # Время уже прошло. Проверяем — это ночной матч на завтра или сыгранный?
+        # Ночной матч: локальное время старта в диапазоне 00:00–05:59
+        # И при этом сейчас вечер (после 18:00 локального) — тогда это завтра.
+        is_night_match = hour < 6
+        is_evening_now = local_now.hour >= 18
+
+        if is_night_match and is_evening_now:
+            # Ночной матч на завтра
+            match_time_utc += timedelta(days=1)
+        else:
+            # Сыгранный матч — игнорируем
+            return None
 
     return Prediction(
         text=text,
