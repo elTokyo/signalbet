@@ -23,8 +23,9 @@ FALLBACK_HOSTS = [
     "line-lb03-w.bk6bba-resources.com",
 ]
 
-# Endpoint с командами и live-флагом
-ENDPOINT_PATH = "/ma/events/listBase?lang=en&scopeMarket=1600"
+# Endpoint со списком событий (команды + live-флаг + версия)
+# ВАЖНО: listBase отдаёт только метаданные без events — нужен events/list
+ENDPOINT_PATH = "/ma/events/list?lang=en&scopeMarket=1600"
 
 HEADERS = {
     "User-Agent": (
@@ -123,28 +124,50 @@ def fetch_events() -> list[dict]:
             _url_cache["ts"] = 0
         return []
 
-    # Сначала собираем все события в словарь по eventId
+    raw_events = data.get("events", [])
+    logger.info(f"Fonbet raw events: {len(raw_events)}")
+
+    if not raw_events:
+        # Логируем какие вообще ключи пришли — для диагностики
+        logger.warning(f"Fonbet: нет events. Ключи ответа: {list(data.keys())[:20]}")
+        return []
+
+    # Карта sportId → название (для определения футбола)
+    # У Фонбета футбол обычно sportId=1, но проверим динамически по названию
+    football_sport_ids = set()
+    for sport in data.get("sports", []):
+        name = (sport.get("name") or "").lower()
+        if "football" in name or "soccer" in name or "футбол" in name:
+            football_sport_ids.add(sport.get("id"))
+    # Фолбэк: классический id=1
+    if not football_sport_ids:
+        football_sport_ids = {1}
+    logger.info(f"Fonbet football sportIds: {football_sport_ids}")
+
+    # Собираем события в словарь по eventId
     events_map = {}
-    for ev in data.get("events", []):
-        # Только футбол (sportId=1)
-        if ev.get("sportId") != 1:
+    for ev in raw_events:
+        sport_id = ev.get("sportId") or ev.get("sport") or ev.get("sportKindId")
+        # Берём футбол ИЛИ если sport не определён — пропускаем фильтр (на всякий случай)
+        if football_sport_ids and sport_id not in football_sport_ids:
             continue
-        team1 = ev.get("team1") or ev.get("name1") or ""
+        team1 = ev.get("team1") or ev.get("name1") or ev.get("name") or ""
         team2 = ev.get("team2") or ev.get("name2") or ""
         if not team1 or not team2:
             continue
         events_map[ev.get("id")] = {
             "team1": team1,
             "team2": team2,
-            "is_live": bool(ev.get("live") or ev.get("inLive")),
+            "is_live": bool(ev.get("live") or ev.get("inLive") or ev.get("isLive")),
             "odd_p1": None,
             "odd_p2": None,
         }
 
+    logger.info(f"Fonbet football events после фильтра: {len(events_map)}")
+
     # Парсим customFactors — там лежат коэффициенты
     # Структура: customFactors -> [{e: eventId, factors: [{f: factorType, v: value}, ...]}]
     # Тип фактора 921 (Win1) и 923 (Win2) — победа команды 1 и 2
-    # На некоторых версиях используется иной формат — ищем в нескольких полях
     for entry in data.get("customFactors", []):
         eid = entry.get("e")
         if eid not in events_map:
