@@ -129,31 +129,19 @@ def fetch_events() -> list[dict]:
     logger.info(f"Fonbet raw events: {len(raw_events)}")
 
     if not raw_events:
-        # Логируем какие вообще ключи пришли — для диагностики
         logger.warning(f"Fonbet: нет events. Ключи ответа: {list(data.keys())[:20]}")
         return []
 
-    # Карта sportId → название (для определения футбола)
-    # У Фонбета футбол обычно sportId=1, но проверим динамически по названию
-    football_sport_ids = set()
-    for sport in data.get("sports", []):
-        name = (sport.get("name") or "").lower()
-        if "football" in name or "soccer" in name or "футбол" in name:
-            football_sport_ids.add(sport.get("id"))
-    # Фолбэк: классический id=1
-    if not football_sport_ids:
-        football_sport_ids = {1}
-    logger.info(f"Fonbet football sportIds: {football_sport_ids}")
-
-    # Собираем события в словарь по eventId
+    # Берём ВСЕ события у которых есть две команды.
+    # Фильтр по виду спорта не нужен: бот ищет конкретные команды через fuzzy,
+    # и футбольные названия сматчатся только с футбольными событиями.
+    # У Фонбета прематч-матчи часто не имеют прямого sportId (он у турнира-родителя),
+    # поэтому фильтрация по sportId выбрасывала почти все события.
     events_map = {}
     for ev in raw_events:
-        sport_id = ev.get("sportId") or ev.get("sport") or ev.get("sportKindId")
-        # Берём футбол ИЛИ если sport не определён — пропускаем фильтр (на всякий случай)
-        if football_sport_ids and sport_id not in football_sport_ids:
-            continue
-        team1 = ev.get("team1") or ev.get("name1") or ev.get("name") or ""
+        team1 = ev.get("team1") or ev.get("name1") or ""
         team2 = ev.get("team2") or ev.get("name2") or ""
+        # Нужны именно матчи команда-против-команды (оба поля заполнены)
         if not team1 or not team2:
             continue
         events_map[ev.get("id")] = {
@@ -164,7 +152,7 @@ def fetch_events() -> list[dict]:
             "odd_p2": None,
         }
 
-    logger.info(f"Fonbet football events после фильтра: {len(events_map)}")
+    logger.info(f"Fonbet events с двумя командами: {len(events_map)}")
 
     # Парсим customFactors — там лежат коэффициенты
     # Структура: customFactors -> [{e: eventId, factors: [{f: factorType, v: value}, ...]}]
