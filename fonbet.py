@@ -38,6 +38,26 @@ HEADERS = {
 }
 
 FUZZY_THRESHOLD = 80   # минимальный % совпадения команд (token_sort_ratio)
+
+# ── Коды факторов Фонбета (определены эмпирически через /factors + сверку с сайтом) ──
+# Победители основного времени
+CODE_WIN1 = 921   # П1
+CODE_WIN2 = 923   # П2
+
+# Форы МАТЧА (основное время). Один код может давать разный pt в разных матчах,
+# поэтому при поиске форы фильтруем И по коду из этого набора, И по значению pt.
+HANDICAP_MATCH_TEAM1 = {927, 989, 910, 1569, 1672}  # форы Ф1 матча (pt отрицательный/0)
+HANDICAP_MATCH_TEAM2 = {928, 991, 912, 1572, 1675}  # форы Ф2 матча (зеркало)
+
+# Форы 1-го ТАЙМА. Ограничены значениями 0/±1/±1.5.
+HANDICAP_1STHALF_TEAM1 = {1672, 1678, 1681}  # внимание: 1672 — pt=0 встречается в обоих
+HANDICAP_1STHALF_TEAM2 = {1675, 1677, 1680}
+
+# Конкретные коды для значений 1-го тайма (по сверке скриншотов):
+# 1678 = Ф1 -1 (1й тайм), 1681 = Ф1 -1.5 (1й тайм)
+# 1677 = Ф2 +1 (1й тайм), 1680 = Ф2 +1.5 (1й тайм)
+CODE_1STHALF_HANDICAP_T1_MINUS15 = 1681   # Ф1 -1.5 первого тайма (ключевой для СЛУЧАЯ 3)
+CODE_1STHALF_HANDICAP_T2_MINUS15 = 1680   # Ф2 -1.5 первого тайма (зеркально +1.5 на Ф1)
 CACHE_TTL = 3600       # обновляем URL раз в час
 
 _url_cache: dict = {"url": None, "ts": 0}
@@ -150,13 +170,13 @@ def fetch_events() -> list[dict]:
             "is_live": bool(ev.get("live") or ev.get("inLive") or ev.get("isLive")),
             "odd_p1": None,
             "odd_p2": None,
+            "factors": [],   # все факторы: [{f: код, v: кэф, pt: значение}, ...]
         }
 
     logger.info(f"Fonbet events с двумя командами: {len(events_map)}")
 
     # Парсим customFactors — там лежат коэффициенты
-    # Структура: customFactors -> [{e: eventId, factors: [{f: factorType, v: value}, ...]}]
-    # Тип фактора 921 (Win1) и 923 (Win2) — победа команды 1 и 2
+    # Структура: customFactors -> [{e: eventId, factors: [{f: factorType, v: value, pt: param}, ...]}]
     for entry in data.get("customFactors", []):
         eid = entry.get("e")
         if eid not in events_map:
@@ -166,10 +186,16 @@ def fetch_events() -> list[dict]:
             val = f.get("v")
             if val is None:
                 continue
-            # Стандартные типы Win1/Win2 в Fonbet
-            if ftype == 921:   # П1
+            # Сохраняем фактор целиком для анализа фор
+            events_map[eid]["factors"].append({
+                "f": ftype,
+                "v": val,
+                "pt": f.get("pt"),
+            })
+            # Дублируем П1/П2 в отдельные поля для быстрого доступа
+            if ftype == CODE_WIN1:
                 events_map[eid]["odd_p1"] = val
-            elif ftype == 923: # П2
+            elif ftype == CODE_WIN2:
                 events_map[eid]["odd_p2"] = val
 
     result = list(events_map.values())
@@ -332,3 +358,160 @@ def find_matching_event(pred_text: str, events: list[dict]) -> Optional[dict]:
         return best_event
 
     return None
+
+
+# ── Определение «кривого» (value) матча ──────────────────────────────────────
+import re as _re
+
+
+def parse_bet_from_prediction(text: str) -> Optional[dict]:
+    """
+    Извлекает тип ставки и порог из текста прогноза.
+
+    Победитель:
+      'п1 4+' / 'п2 3+' / 'P1 5+' → {type: 'win', team: 1|2, threshold: 4.0}
+    Фора:
+      'ф1-2,5' / 'ф2 -3.5' / 'Ф1 -4,5' → {type: 'handicap', team: 1|2, value: -2.5}
+
+    Возвращает dict или None если ставку не распознать.
+    """
+    t = text.lower()
+
+    # ── Фора: ф1 / ф2 со значением (минус, запятая или точка) ──
+    # примеры: ф1-2,5  ф2 -3.5  ф1 -4,5  ф1-1.5
+    m = _re.search(r'ф\s*([12])\s*(-?\d+[.,]?\d*)', t)
+    if m:
+        team = int(m.group(1))
+        val_raw = m.group(2).replace(',', '.')
+        try:
+            value = float(val_raw)
+        except ValueError:
+            return None
+        # Фора в прогнозах отрицательная (минусовая фора фаворита).
+        # Если знак не указан — считаем отрицательной.
+        if value > 0:
+            value = -value
+        return {"type": "handicap", "team": team, "value": value}
+
+    # ── Победитель: п1 / п2 с порогом N+ ──
+    # примеры: п1 4+  п2 3+  п1 100+
+    m = _re.search(r'п\s*([12])\s*(\d+)\s*\+', t)
+    if m:
+        team = int(m.group(1))
+        threshold = float(m.group(2))
+        return {"type": "win", "team": team, "threshold": threshold}
+
+    return None
+
+
+def _find_factor(factors: list[dict], codes: set, pt_value: float, tol: float = 0.05) -> Optional[float]:
+    """
+    Ищет коэффициент фактора по набору кодов и значению pt.
+    Возвращает кэф или None.
+    """
+    for f in factors:
+        if f["f"] not in codes:
+            continue
+        pt = f.get("pt")
+        if pt is None:
+            continue
+        try:
+            if abs(float(pt) - pt_value) < tol:
+                return f["v"]
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def check_crookedness(pred_text: str, event: dict) -> Optional[dict]:
+    """
+    Проверяет матч на «кривизну» (value) по спецификации.
+    event — словарь из fetch_events (с полем 'factors').
+
+    Возвращает dict с описанием если матч кривой, иначе None:
+      {team1, team2, is_live, reason, odds_info}
+    """
+    bet = parse_bet_from_prediction(pred_text)
+    if not bet:
+        return None
+
+    factors = event.get("factors", [])
+    if not factors:
+        return None
+
+    crooked = False
+    reason = ""
+    odds_info = ""
+
+    if bet["type"] == "win":
+        # СЛУЧАЙ 1 — Победитель
+        threshold = bet["threshold"]
+        odd_p1 = event.get("odd_p1")
+        odd_p2 = event.get("odd_p2")
+
+        # кэф на свою команду и на противоположную
+        if bet["team"] == 1:
+            own, opp = odd_p1, odd_p2
+        else:
+            own, opp = odd_p2, odd_p1
+
+        # Кривой если: кэф на свою ≥ порог, ИЛИ кэф на чужую ≥ 8.0
+        if own is not None and own >= threshold:
+            crooked = True
+            reason = f"П{bet['team']} ≥ {threshold:g}"
+        elif opp is not None and opp >= 8.0:
+            crooked = True
+            other = 2 if bet["team"] == 1 else 1
+            reason = f"П{other} ≥ 8.0 (можно тащить андердога)"
+
+        p1s = f"{odd_p1:.2f}" if odd_p1 else "—"
+        p2s = f"{odd_p2:.2f}" if odd_p2 else "—"
+        odds_info = f"П1: {p1s}  |  П2: {p2s}"
+
+    elif bet["type"] == "handicap":
+        value = bet["value"]   # отрицательное, напр -2.5, -3.5
+        team = bet["team"]
+
+        if team == 1:
+            match_codes = HANDICAP_MATCH_TEAM1
+            half_minus15_code = {CODE_1STHALF_HANDICAP_T1_MINUS15}
+        else:
+            match_codes = HANDICAP_MATCH_TEAM2
+            half_minus15_code = {CODE_1STHALF_HANDICAP_T2_MINUS15}
+
+        # кэф на фору из прогноза в основное время
+        match_handicap_odd = _find_factor(factors, match_codes, value)
+
+        if abs(value) <= 2.5:
+            # СЛУЧАЙ 2 — малая фора (-2.5): тайм не смотрим
+            if match_handicap_odd is not None and match_handicap_odd >= 3.0:
+                crooked = True
+                reason = f"Ф{team} {value:g} ≥ 3.0"
+            mo = f"{match_handicap_odd:.2f}" if match_handicap_odd else "—"
+            odds_info = f"Ф{team} {value:g}: {mo}"
+        else:
+            # СЛУЧАЙ 3 — большая фора (-3.5 и больше)
+            # кривой если: фора матча ≥ 2.5 ИЛИ фора 1 тайма -1.5 ≥ 2.9
+            half_handicap_odd = _find_factor(factors, half_minus15_code, -1.5)
+
+            if match_handicap_odd is not None and match_handicap_odd >= 2.5:
+                crooked = True
+                reason = f"Ф{team} {value:g} (матч) ≥ 2.5"
+            elif half_handicap_odd is not None and half_handicap_odd >= 2.9:
+                crooked = True
+                reason = f"Ф{team} -1.5 (1й тайм) ≥ 2.9"
+
+            mo = f"{match_handicap_odd:.2f}" if match_handicap_odd else "—"
+            ho = f"{half_handicap_odd:.2f}" if half_handicap_odd else "—"
+            odds_info = f"Ф{team} {value:g} матч: {mo}  |  Ф{team} -1.5 тайм: {ho}"
+
+    if not crooked:
+        return None
+
+    return {
+        "team1": event["team1"],
+        "team2": event["team2"],
+        "is_live": event["is_live"],
+        "reason": reason,
+        "odds_info": odds_info,
+    }

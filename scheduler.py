@@ -8,7 +8,7 @@ import storage
 import config
 import auth
 from parser import format_reminder
-from fonbet import fetch_events, find_matching_event, extract_teams_from_prediction
+from fonbet import fetch_events, find_matching_event, extract_teams_from_prediction, check_crookedness
 
 logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler()
@@ -150,6 +150,22 @@ async def fonbet_tick(app: Application):
             pred.fonbet_notified_prematch = True
             changed = True
             logger.info(f"[fonbet prematch] {team1} — {team2}")
+
+        # ── Проверка на «кривой» матч (value) ──
+        if not pred.crooked_notified:
+            crooked = check_crookedness(pred.text, event)
+            if crooked:
+                status = "🔴 LIVE" if crooked["is_live"] else "📋 Прематч"
+                msg = (
+                    f"💰 КРИВОЙ МАТЧ! ({status})\n"
+                    f"{crooked['team1']} — {crooked['team2']}\n"
+                    f"⚡ {crooked['reason']}\n"
+                    f"{crooked['odds_info']}"
+                )
+                await _broadcast(app, recipients, msg)
+                pred.crooked_notified = True
+                changed = True
+                logger.info(f"[fonbet CROOKED] {team1} — {team2}: {crooked['reason']}")
 
     if changed:
         storage.save_predictions(predictions=predictions)
