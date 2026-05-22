@@ -166,7 +166,11 @@ def fetch_events() -> list[dict]:
             continue
         events_map[ev.get("id")] = {
             "id": ev.get("id"),
-            "parent_id": ev.get("parentId") or ev.get("parent"),
+            # ID лиги/турнира — пробуем разные поля Фонбета
+            "league_id": (ev.get("tournamentId") or ev.get("tournament")
+                          or ev.get("parentId") or ev.get("parent")),
+            # Время старта матча (Unix timestamp в секундах)
+            "start_time": ev.get("startTime") or ev.get("start") or ev.get("time"),
             "team1": team1,
             "team2": team2,
             "is_live": bool(ev.get("live") or ev.get("inLive") or ev.get("isLive")),
@@ -315,51 +319,97 @@ def extract_teams_from_prediction(text: str) -> tuple[str, str]:
     return team1, team2
 
 
-def find_matching_event(pred_text: str, events: list[dict]) -> Optional[dict]:
+def find_matching_event(pred_text: str, events: list[dict],
+                        expected_utc=None, time_tolerance_min: int = 15) -> Optional[dict]:
     """
     Ищет матч из прогноза среди событий Фонбета.
     Возвращает событие если найдено (с коэффициентами), иначе None.
 
-    Использует token_sort_ratio (учитывает ВСЕ слова, а не только вхождение)
-    чтобы 'Канберра' не матчилось с 'Канберра Ювентус'.
+    Использует token_sort_ratio + проверку времени старта:
+    - Если время старта Фонбета совпадает с expected_utc (±tolerance) — матч подтверждён,
+      даже при чуть меньшем fuzzy-score.
+    - Если время НЕ совпадает — требуется очень высокий fuzzy (исключает путаницу
+      U20 с основным составом, которые играют в разное время).
+
+    expected_utc — datetime (UTC, naive) ожидаемого времени матча из прогноза.
     """
+    import datetime as _dt
+
     pred_t1, pred_t2 = extract_teams_from_prediction(pred_text)
     if not pred_t1:
         return None
 
-    best_score = 0
-    best_event = None
-
     p1 = pred_t1.lower()
     p2 = pred_t2.lower() if pred_t2 else ""
+
+    candidates = []  # (score, time_ok, event)
 
     for ev in events:
         e1 = ev["team1"].lower()
         e2 = ev["team2"].lower()
 
         if p2:
-            # token_sort_ratio строже: сравнивает наборы слов целиком.
-            # 'канберра' vs 'канберра ювентус' даст ~60%, а не ~100% как partial_ratio
             direct = (fuzz.token_sort_ratio(p1, e1) + fuzz.token_sort_ratio(p2, e2)) / 2
             reverse = (fuzz.token_sort_ratio(p1, e2) + fuzz.token_sort_ratio(p2, e1)) / 2
             score = max(direct, reverse)
         else:
             score = fuzz.token_sort_ratio(p1, e1)
 
-        if score > best_score:
-            best_score = score
-            best_event = ev
+        if score < FUZZY_THRESHOLD:
+            continue
 
-    if best_score >= FUZZY_THRESHOLD:
-        logger.info(
-            f"Fonbet match [{best_score:.0f}%]: "
-            f"'{pred_t1} vs {pred_t2}' → "
-            f"'{best_event['team1']} vs {best_event['team2']}' "
-            f"({'LIVE' if best_event['is_live'] else 'Prematch'})"
-        )
-        return best_event
+        # Проверка времени старта
+        time_ok = None  # None = не смогли проверить
+        if expected_utc is not None and ev.get("start_time"):
+            try:
+                ev_start = _dt.datetime.utcfromtimestamp(int(ev["start_time"]))
+                diff_min = abs((ev_start - expected_utc).total_seconds()) / 60
+                time_ok = diff_min <= time_tolerance_min
+            except (ValueError, TypeError, OSError):
+                time_ok = None
 
-    return None
+        candidates.append((score, time_ok, ev))
+
+    if not candidates:
+        return None
+
+    # Приоритет:
+    # 1. Совпало время (time_ok=True) — берём с лучшим score среди таких
+    # 2. Время проверить не смогли (time_ok=None) — берём если score высокий
+    # 3. Время НЕ совпало (time_ok=False) — берём только если score почти идеальный (>=95)
+
+    time_matched = [c for c in candidates if c[1] is True]
+    time_unknown = [c for c in candidates if c[1] is None]
+    time_mismatch = [c for c in candidates if c[1] is False]
+
+    chosen = None
+    if time_matched:
+        chosen = max(time_matched, key=lambda c: c[0])
+        reason = "время+команды"
+    elif time_unknown:
+        best = max(time_unknown, key=lambda c: c[0])
+        if best[0] >= FUZZY_THRESHOLD:
+            chosen = best
+            reason = "команды (время неизвестно)"
+    elif time_mismatch:
+        # Время не совпало — высокий риск ложного матча (U20 vs основа).
+        # Берём ТОЛЬКО при почти идеальном совпадении названий.
+        best = max(time_mismatch, key=lambda c: c[0])
+        if best[0] >= 95:
+            chosen = best
+            reason = "только команды (ВРЕМЯ НЕ СОВПАЛО!)"
+
+    if not chosen:
+        return None
+
+    score, time_ok, event = chosen
+    logger.info(
+        f"Fonbet match [{score:.0f}%, {reason}]: "
+        f"'{pred_t1} vs {pred_t2}' → "
+        f"'{event['team1']} vs {event['team2']}' "
+        f"({'LIVE' if event['is_live'] else 'Prematch'})"
+    )
+    return event
 
 
 # ── Определение «кривого» (value) матча ──────────────────────────────────────
@@ -369,16 +419,17 @@ import re as _re
 def build_match_url(event: dict) -> str:
     """
     Собирает ссылку на матч на сайте Фонбета.
-    Формат с лигой: fon.bet/sports/football/{parentId}/{id}
-    Упрощённый: fon.bet/sports/football/{id}
+    Лайв:    fon.bet/live/football/{league_id}/{id}
+    Прематч: fon.bet/sports/football/{league_id}/{id}
     """
     eid = event.get("id")
-    parent = event.get("parent_id")
+    league = event.get("league_id")
     if not eid:
         return "https://fon.bet/"
-    if parent:
-        return f"https://fon.bet/sports/football/{parent}/{eid}"
-    return f"https://fon.bet/sports/football/{eid}"
+    section = "live" if event.get("is_live") else "sports"
+    if league:
+        return f"https://fon.bet/{section}/football/{league}/{eid}"
+    return f"https://fon.bet/{section}/football/{eid}"
 
 
 def parse_bet_from_prediction(text: str) -> Optional[dict]:

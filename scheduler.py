@@ -21,6 +21,15 @@ scheduler = AsyncIOScheduler()
 FONBET_WINDOW_BEFORE_MIN = 60
 FONBET_WINDOW_AFTER_MIN  = 20
 
+# «Горячее» окно — частые проверки (10 мин до старта → 10 мин после)
+HOT_WINDOW_BEFORE_MIN = 10
+HOT_WINDOW_AFTER_MIN  = 10
+
+# Тик Фонбета раз в 15 сек. «Холодные» матчи проверяем раз в 4 тика (=60 сек),
+# «горячие» — каждый тик (=15 сек).
+FONBET_TICK_SEC = 15
+_tick_counter = 0
+
 
 def setup_scheduler(app: Application):
     # Job 1: таймер-напоминания + автоудаление (каждые 30 сек)
@@ -31,16 +40,16 @@ def setup_scheduler(app: Application):
         id="notification_tick",
         replace_existing=True,
     )
-    # Job 2: проверка Фонбета (каждые 60 сек)
+    # Job 2: проверка Фонбета (каждые 15 сек, с горячим/холодным окном внутри)
     scheduler.add_job(
         fonbet_tick,
-        trigger=IntervalTrigger(seconds=60),
+        trigger=IntervalTrigger(seconds=FONBET_TICK_SEC),
         args=[app],
         id="fonbet_tick",
         replace_existing=True,
     )
     scheduler.start()
-    logger.info("Scheduler запущен: notifications 30с, fonbet 60с")
+    logger.info(f"Scheduler запущен: notifications 30с, fonbet {FONBET_TICK_SEC}с (горячее окно ±10мин)")
 
 
 # ── Уведомления за 30/5 мин + автоудаление ───────────────────────────────────
@@ -87,7 +96,15 @@ async def notification_tick(app: Application):
 # ── Fonbet: prematch + live ──────────────────────────────────────────────────
 
 async def fonbet_tick(app: Application):
-    """Каждые 60 сек: проверяет Fonbet на появление прогнозов prematch/live."""
+    """
+    Каждые 15 сек: проверяет Fonbet.
+    Горячие матчи (±10 мин от старта) — каждый тик.
+    Холодные (остальное окно) — раз в 60 сек (каждый 4-й тик).
+    """
+    global _tick_counter
+    _tick_counter += 1
+    is_cold_tick = (_tick_counter % 4 == 0)  # каждый 4-й тик (раз в 60с) проверяем и холодные
+
     now = datetime.utcnow()
     predictions = storage.load_predictions()
     if not predictions:
@@ -96,12 +113,19 @@ async def fonbet_tick(app: Application):
     # Отбираем прогнозы которые нужно мониторить
     to_check = []
     for p in predictions:
-        if p.fonbet_notified_prematch and p.fonbet_notified_live:
+        if p.fonbet_notified_prematch and p.fonbet_notified_live and p.crooked_notified:
             continue  # уже всё уведомлено
         diff_min = (p.match_time - now).total_seconds() / 60
-        # В окне: за 60 мин до старта → +20 мин после старта
-        # (то есть от -20 мин (= матч идёт 20 мин) до 60 мин до старта)
-        if -FONBET_WINDOW_AFTER_MIN <= diff_min <= FONBET_WINDOW_BEFORE_MIN:
+
+        # В общем окне мониторинга?
+        if not (-FONBET_WINDOW_AFTER_MIN <= diff_min <= FONBET_WINDOW_BEFORE_MIN):
+            continue
+
+        # Горячее окно (±10 мин) — проверяем каждый тик
+        is_hot = (-HOT_WINDOW_AFTER_MIN <= diff_min <= HOT_WINDOW_BEFORE_MIN)
+
+        # Горячие — всегда; холодные — только на каждом 4-м тике
+        if is_hot or is_cold_tick:
             to_check.append(p)
 
     if not to_check:
@@ -123,7 +147,8 @@ async def fonbet_tick(app: Application):
 
     changed = False
     for pred in to_check:
-        event = find_matching_event(pred.text, events)
+        # Передаём ожидаемое время матча (UTC) для проверки соответствия
+        event = find_matching_event(pred.text, events, expected_utc=pred.match_time)
         if not event:
             continue
 
