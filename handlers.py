@@ -111,27 +111,47 @@ async def _send_help(update: Update, user_id: int):
 
 @require_auth
 async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    preds = storage.load_predictions(chat_id)
-    s = storage.load_settings(chat_id)
+    user_id = update.effective_user.id
+    preds = storage.load_predictions()
+    s = storage.load_settings(user_id)
 
     if not preds:
         await update.message.reply_text("📋 Список пуст.")
         return
 
-    lines = [f"📋 *Активных прогнозов: {len(preds)}*\n"]
+    is_adm = auth.is_admin(user_id)
+
+    lines = [f"📋 Активных прогнозов: {len(preds)}\n"]
     for i, p in enumerate(preds, 1):
         t = format_time_local(p, s.timezone_offset)
         status = " 🔔" if p.notified_30 else ""
         status = " ✅" if p.notified_5 else status
         src = " 🤖" if p.source == "discord" else ""
-        # Админам показываем ID для удаления, остальным — нет
-        id_line = f"\n   🆔 `{p.id}`" if auth.is_admin(update.effective_user.id) else ""
+        # Админам показываем ID для удаления (без Markdown — скобки в названиях ломают разметку)
+        id_line = f"\n   🆔 {p.id}" if is_adm else ""
         lines.append(f"{i}. ⏰ {t}{status}{src}\n   {p.text}{id_line}")
 
-    if auth.is_admin(update.effective_user.id):
-        lines.append("\nДля удаления: `/delete <id>`")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    if is_adm:
+        lines.append("\nДля удаления: /delete <id>")
+
+    # Telegram ограничивает сообщение ~4096 символами.
+    # Разбиваем на куски по строкам, не превышая лимит.
+    await _send_chunked(update, lines, limit=3900)
+
+
+async def _send_chunked(update: Update, lines: list[str], limit: int = 3900):
+    """Отправляет список строк, разбивая на сообщения не длиннее limit символов."""
+    buffer = ""
+    for line in lines:
+        # +1 на перенос строки
+        if len(buffer) + len(line) + 1 > limit:
+            if buffer:
+                await update.message.reply_text(buffer)
+            buffer = line
+        else:
+            buffer = f"{buffer}\n{line}" if buffer else line
+    if buffer:
+        await update.message.reply_text(buffer)
 
 
 @require_auth
