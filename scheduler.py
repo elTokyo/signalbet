@@ -171,15 +171,38 @@ async def fonbet_tick(app: Application):
             logger.info(f"[fonbet live] {team1} — {team2}")
 
         elif (not event["is_live"]) and not pred.fonbet_notified_prematch:
-            msg = (
-                f"📋 Матч вышел в прематч!\n"
-                f"{team1} — {team2}\n"
-                f"{odds_line}"
-            )
-            await _broadcast(app, recipients, msg, url=match_url)
-            pred.fonbet_notified_prematch = True
-            changed = True
-            logger.info(f"[fonbet prematch] {team1} — {team2}")
+            has_odds = event.get("odd_p1") is not None or event.get("odd_p2") is not None
+            diff_min = (pred.match_time - now).total_seconds() / 60
+            # Прошло ли 10 минут после старта? (diff_min < -10)
+            past_deadline = diff_min < -10
+
+            if has_odds:
+                # Коэффициенты есть — уведомляем сразу
+                msg = (
+                    f"📋 Матч вышел в прематч!\n"
+                    f"{team1} — {team2}\n"
+                    f"{odds_line}"
+                )
+                await _broadcast(app, recipients, msg, url=match_url)
+                pred.fonbet_notified_prematch = True
+                changed = True
+                logger.info(f"[fonbet prematch] {team1} — {team2}")
+            elif past_deadline:
+                # Коэффициентов так и нет, но 10 мин после старта прошло —
+                # уведомляем без коэффициентов (вариант А) и закрываем
+                msg = (
+                    f"📋 Матч вышел в прематч!\n"
+                    f"{team1} — {team2}\n"
+                    f"(коэф. так и не появились)"
+                )
+                await _broadcast(app, recipients, msg, url=match_url)
+                pred.fonbet_notified_prematch = True
+                changed = True
+                logger.info(f"[fonbet prematch no-odds timeout] {team1} — {team2}")
+            else:
+                # Матч найден, но коэф ещё нет и дедлайн не прошёл —
+                # НЕ ставим флаг, продолжим проверять в следующих тиках
+                logger.info(f"[fonbet prematch waiting odds] {team1} — {team2}")
 
         # ── Проверка на «кривой» матч (value) ──
         if not pred.crooked_notified:

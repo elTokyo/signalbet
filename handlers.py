@@ -634,6 +634,13 @@ async def cmd_factors(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{status}  (совпадение {result.get('match_score')}%)",
         f"{result['team1']} — {result['team2']}",
         f"Всего факторов: {len(factors)}",
+    ]
+    raw = result.get("raw_fields")
+    if raw:
+        lines.append("\n🔧 Поля события (для ссылки):")
+        for k, v in raw.items():
+            lines.append(f"  {k} = {v}")
+    lines += [
         "",
         "Код | Кэф | Параметр",
         "─────────────────────",

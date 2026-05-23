@@ -164,11 +164,19 @@ def fetch_events() -> list[dict]:
         # Нужны именно матчи команда-против-команды (оба поля заполнены)
         if not team1 or not team2:
             continue
+        # ID лиги/турнира для ссылки. У Фонбета матч ссылается на лигу-сегмент
+        # через parentId (ближайший родитель) или первый элемент parentIds.
+        league_id = ev.get("parentId")
+        if not league_id:
+            pids = ev.get("parentIds")
+            if isinstance(pids, list) and pids:
+                league_id = pids[0]
+        if not league_id:
+            league_id = ev.get("tournamentId") or ev.get("tournament")
+
         events_map[ev.get("id")] = {
             "id": ev.get("id"),
-            # ID лиги/турнира — пробуем разные поля Фонбета
-            "league_id": (ev.get("tournamentId") or ev.get("tournament")
-                          or ev.get("parentId") or ev.get("parent")),
+            "league_id": league_id,
             # Время старта матча (Unix timestamp в секундах)
             "start_time": ev.get("startTime") or ev.get("start") or ev.get("time"),
             "team1": team1,
@@ -238,6 +246,7 @@ def dump_event_factors(pred_text: str) -> Optional[dict]:
 
     target_id = None
     target_info = None
+    target_raw = None
     best_score = 0
 
     p1 = pred_t1.lower()
@@ -258,6 +267,7 @@ def dump_event_factors(pred_text: str) -> Optional[dict]:
         if score > best_score:
             best_score = score
             target_id = ev.get("id")
+            target_raw = ev   # сохраняем сырое событие для диагностики
             target_info = {
                 "team1": team1,
                 "team2": team2,
@@ -266,6 +276,13 @@ def dump_event_factors(pred_text: str) -> Optional[dict]:
 
     if not target_id or best_score < FUZZY_THRESHOLD:
         return None
+
+    # Сохраняем все поля события содержащие "id"/"time"/"parent" — для диагностики ссылки
+    if target_raw:
+        target_info["raw_fields"] = {
+            k: v for k, v in target_raw.items()
+            if any(s in k.lower() for s in ("id", "time", "parent", "tournament", "league", "sport"))
+        }
 
     # Собираем ВСЕ факторы этого матча
     all_factors = []
