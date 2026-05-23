@@ -14,6 +14,8 @@ from fonbet import (
     check_crookedness, build_match_url,
 )
 
+import asyncio
+
 logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler()
 
@@ -29,6 +31,15 @@ HOT_WINDOW_AFTER_MIN  = 10
 # «горячие» — каждый тик (=15 сек).
 FONBET_TICK_SEC = 15
 _tick_counter = 0
+
+# Защита от дублей уведомлений при гонке тиков (Gist пишется с задержкой).
+# Храним id прогнозов по которым уже отправили уведомление в этой сессии.
+_sent_prematch: set = set()
+_sent_live: set = set()
+_sent_crooked: set = set()
+
+# Лок чтобы тики не накладывались друг на друга (тик может длиться >15 сек)
+_fonbet_lock = asyncio.Lock()
 
 
 def setup_scheduler(app: Application):
@@ -101,6 +112,16 @@ async def fonbet_tick(app: Application):
     Горячие матчи (±10 мин от старта) — каждый тик.
     Холодные (остальное окно) — раз в 60 сек (каждый 4-й тик).
     """
+    # Если предыдущий тик ещё выполняется — пропускаем (защита от наложения)
+    if _fonbet_lock.locked():
+        logger.debug("fonbet_tick: предыдущий тик ещё идёт, пропуск")
+        return
+
+    async with _fonbet_lock:
+        await _fonbet_tick_inner(app)
+
+
+async def _fonbet_tick_inner(app: Application):
     global _tick_counter
     _tick_counter += 1
     is_cold_tick = (_tick_counter % 4 == 0)  # каждый 4-й тик (раз в 60с) проверяем и холодные
@@ -145,7 +166,6 @@ async def fonbet_tick(app: Application):
     if not recipients:
         return
 
-    changed = False
     for pred in to_check:
         # Передаём ожидаемое время матча (UTC) для проверки соответствия
         event = find_matching_event(pred.text, events, expected_utc=pred.match_time)
@@ -157,57 +177,60 @@ async def fonbet_tick(app: Application):
         odds_line = _format_odds(event.get("odd_p1"), event.get("odd_p2"))
         match_url = build_match_url(event)
 
-        if event["is_live"] and not pred.fonbet_notified_live:
+        if event["is_live"] and not pred.fonbet_notified_live and pred.id not in _sent_live:
+            # Помечаем ДО отправки чтобы параллельный тик не продублировал
+            _sent_live.add(pred.id)
+            _sent_prematch.add(pred.id)
+            pred.fonbet_notified_live = True
+            pred.fonbet_notified_prematch = True
+            storage.save_predictions(predictions=predictions)  # сохраняем флаг сразу
             msg = (
                 f"🔴 Матч вышел в лайв!\n"
                 f"{team1} — {team2}\n"
                 f"{odds_line}"
             )
             await _broadcast(app, recipients, msg, url=match_url)
-            pred.fonbet_notified_live = True
-            # Раз дошли до live — prematch тоже больше не нужен
-            pred.fonbet_notified_prematch = True
-            changed = True
             logger.info(f"[fonbet live] {team1} — {team2}")
 
-        elif (not event["is_live"]) and not pred.fonbet_notified_prematch:
+        elif (not event["is_live"]) and not pred.fonbet_notified_prematch and pred.id not in _sent_prematch:
             has_odds = event.get("odd_p1") is not None or event.get("odd_p2") is not None
             diff_min = (pred.match_time - now).total_seconds() / 60
-            # Прошло ли 10 минут после старта? (diff_min < -10)
             past_deadline = diff_min < -10
 
             if has_odds:
-                # Коэффициенты есть — уведомляем сразу
+                _sent_prematch.add(pred.id)
+                pred.fonbet_notified_prematch = True
+                storage.save_predictions(predictions=predictions)
                 msg = (
                     f"📋 Матч вышел в прематч!\n"
                     f"{team1} — {team2}\n"
-                    f"{odds_line}"
+                    f"{odds_line}\n\n"
+                    f"📝 Прогноз:\n{pred.text}"
                 )
                 await _broadcast(app, recipients, msg, url=match_url)
-                pred.fonbet_notified_prematch = True
-                changed = True
                 logger.info(f"[fonbet prematch] {team1} — {team2}")
             elif past_deadline:
-                # Коэффициентов так и нет, но 10 мин после старта прошло —
-                # уведомляем без коэффициентов (вариант А) и закрываем
+                _sent_prematch.add(pred.id)
+                pred.fonbet_notified_prematch = True
+                storage.save_predictions(predictions=predictions)
                 msg = (
                     f"📋 Матч вышел в прематч!\n"
                     f"{team1} — {team2}\n"
-                    f"(коэф. так и не появились)"
+                    f"(коэф. так и не появились)\n\n"
+                    f"📝 Прогноз:\n{pred.text}"
                 )
                 await _broadcast(app, recipients, msg, url=match_url)
-                pred.fonbet_notified_prematch = True
-                changed = True
                 logger.info(f"[fonbet prematch no-odds timeout] {team1} — {team2}")
             else:
-                # Матч найден, но коэф ещё нет и дедлайн не прошёл —
-                # НЕ ставим флаг, продолжим проверять в следующих тиках
                 logger.info(f"[fonbet prematch waiting odds] {team1} — {team2}")
 
         # ── Проверка на «кривой» матч (value) ──
-        if not pred.crooked_notified:
+        if not pred.crooked_notified and pred.id not in _sent_crooked:
             crooked = check_crookedness(pred.text, event)
             if crooked:
+                _sent_crooked.add(pred.id)
+                pred.crooked_notified = True
+                storage.save_predictions(predictions=predictions)
                 status = "🔴 LIVE" if crooked["is_live"] else "📋 Прематч"
                 msg = (
                     f"💰 КРИВОЙ МАТЧ! ({status})\n"
@@ -216,12 +239,9 @@ async def fonbet_tick(app: Application):
                     f"{crooked['odds_info']}"
                 )
                 await _broadcast(app, recipients, msg, url=crooked.get("url"))
-                pred.crooked_notified = True
-                changed = True
                 logger.info(f"[fonbet CROOKED] {team1} — {team2}: {crooked['reason']}")
 
-    if changed:
-        storage.save_predictions(predictions=predictions)
+    # Флаги уже сохранены сразу после каждой отправки — финальное сохранение не нужно
 
 
 def _format_odds(odd_p1, odd_p2) -> str:
