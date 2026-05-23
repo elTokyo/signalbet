@@ -164,15 +164,15 @@ def fetch_events() -> list[dict]:
         # Нужны именно матчи команда-против-команды (оба поля заполнены)
         if not team1 or not team2:
             continue
-        # ID лиги/турнира для ссылки. У Фонбета матч ссылается на лигу-сегмент
-        # через parentId (ближайший родитель) или первый элемент parentIds.
-        league_id = ev.get("parentId")
+        # ID лиги/турнира для ссылки.
+        # У Фонбета поле sportId на МАТЧЕ фактически содержит ID лиги-сегмента
+        # (например 124689 = "Бразилия. До 20 лет"), а НЕ вид спорта.
+        # Это же подтверждается структурой URL: fon.bet/.../football/{sportId}/{id}
+        league_id = (ev.get("sportId") or ev.get("parentId"))
         if not league_id:
             pids = ev.get("parentIds")
             if isinstance(pids, list) and pids:
                 league_id = pids[0]
-        if not league_id:
-            league_id = ev.get("tournamentId") or ev.get("tournament")
 
         events_map[ev.get("id")] = {
             "id": ev.get("id"),
