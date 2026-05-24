@@ -22,7 +22,7 @@ from parser import parse_predictions, format_time_local
 logger = logging.getLogger(__name__)
 
 RECHECK_INTERVAL_SEC = 15 * 60   # перечит раз в 15 минут
-RECHECK_HISTORY_LIMIT = 15       # сколько последних сообщений перечитывать
+RECHECK_HISTORY_LIMIT = 50       # читаем больше сообщений чтобы охватить все прогнозы дня
 
 # Ссылки на работающий Discord-клиент и его event loop —
 # нужны чтобы вызвать перечит из другого потока (Telegram-команда /syncdiscord)
@@ -67,32 +67,44 @@ def trigger_manual_recheck() -> tuple[bool, str]:
     try:
         # Планируем корутину в loop Discord-потока
         future = asyncio.run_coroutine_threadsafe(_manual_recheck(), _loop_ref)
-        count = future.result(timeout=30)   # ждём результат до 30 сек
-        return True, f"Проверено сообщений: {count}"
+        stats = future.result(timeout=30)   # ждём результат до 30 сек
+        info = (
+            f"Сообщений: {stats['messages']}\n"
+            f"➕ Добавлено: {stats['added']}\n"
+            f"✏️ Обновлено: {stats['updated']}\n"
+            f"🗑 Удалено: {stats['removed']}"
+        )
+        return True, info
     except Exception as e:
         logger.error(f"Manual recheck error: {e}")
         return False, f"Ошибка: {e}"
 
 
 async def _manual_recheck() -> int:
-    """Перечитывает последние сообщения канала. Возвращает кол-во проверенных."""
+    """Полная синхронизация листа со свежими сообщениями Discord."""
     ch = _client_ref.get_channel(config.DISCORD_CHANNEL_ID)
     if not ch:
         raise RuntimeError("канал не найден")
 
-    count = 0
+    # Собираем ВСЕ прогнозы из свежих сообщений в один список
+    all_preds = []
+    msg_count = 0
     async for msg in ch.history(limit=RECHECK_HISTORY_LIMIT):
         if msg.author == _client_ref.user:
             continue
         if not _is_fresh(msg):
-            continue  # пропускаем вчерашние неубранные прогнозы
-        await _process_static(msg.content, "manual")
-        count += 1
-    return count
+            continue
+        preds = parse_predictions(msg.content, config.DEFAULT_TZ_OFFSET, source="discord")
+        all_preds.extend(preds)
+        msg_count += 1
+
+    # Синхронизируем: добавить новые, обновить изменённые, удалить пропавшие
+    stats = storage.sync_from_discord(all_preds)
+    return {"messages": msg_count, **stats}
 
 
 async def _process_static(content: str, origin: str):
-    """Версия process_message_text доступная вне замыкания (для manual recheck)."""
+    """Обработка одного нового/отредактированного сообщения (on_message/on_message_edit)."""
     preds = parse_predictions(content, config.DEFAULT_TZ_OFFSET, source="discord")
     if not preds:
         return
@@ -143,15 +155,21 @@ def run_discord_listener():
         while not client.is_closed():
             await asyncio.sleep(RECHECK_INTERVAL_SEC)
             try:
-                count = 0
+                all_preds = []
+                msg_count = 0
                 async for msg in ch.history(limit=RECHECK_HISTORY_LIMIT):
                     if msg.author == client.user:
                         continue
                     if not _is_fresh(msg):
                         continue
-                    await _process_static(msg.content, "recheck")
-                    count += 1
-                logger.info(f"Discord periodic recheck: проверено {count} сообщений")
+                    preds = parse_predictions(msg.content, config.DEFAULT_TZ_OFFSET, source="discord")
+                    all_preds.extend(preds)
+                    msg_count += 1
+                stats = storage.sync_from_discord(all_preds)
+                logger.info(
+                    f"Discord periodic sync: сообщений {msg_count}, "
+                    f"+{stats['added']} ~{stats['updated']} -{stats['removed']}"
+                )
             except Exception as e:
                 logger.error(f"Periodic recheck error: {e}")
 

@@ -88,6 +88,90 @@ def add_predictions(chat_id: int = None, new_preds: list[Prediction] = None) -> 
         return len(added)
 
 
+def _match_key(pred: Prediction) -> str:
+    """
+    Ключ матча для сравнения «тот же матч»: команды + время.
+    Команды берём из текста, нормализуем (убираем регистр, лишние пробелы).
+    """
+    import re
+    from fonbet import extract_teams_from_prediction
+    t1, t2 = extract_teams_from_prediction(pred.text)
+    # Нормализация: нижний регистр, только буквы/цифры
+    def norm(s):
+        return re.sub(r'[^a-zа-я0-9]', '', (s or "").lower())
+    teams = "|".join(sorted([norm(t1), norm(t2)]))  # сорт чтобы порядок команд не влиял
+    # Время с точностью до минуты
+    tm = pred.match_time.strftime("%Y%m%d%H%M")
+    return f"{teams}@{tm}"
+
+
+def sync_from_discord(discord_preds: list[Prediction]) -> dict:
+    """
+    Полная синхронизация общего листа с актуальными прогнозами Discord.
+    - новый матч (нет в листе) → добавить
+    - матч есть, текст изменился → обновить текст, сбросить crooked_notified
+    - discord-матч пропал из Discord и ещё НЕ начался → удалить
+
+    Ручные прогнозы (source != 'discord') не трогаем при удалении.
+    Возвращает статистику: {added, updated, removed}.
+    """
+    from datetime import datetime
+
+    with _lock:
+        data = gist_storage.read(FILE_PREDS)
+        existing = [Prediction.from_dict(p) for p in data.get(SHARED_KEY, [])]
+
+        # Индексируем существующие по ключу матча
+        existing_by_key = {}
+        for p in existing:
+            existing_by_key[_match_key(p)] = p
+
+        # Индексируем свежие из Discord
+        discord_by_key = {}
+        for p in discord_preds:
+            discord_by_key[_match_key(p)] = p
+
+        added = updated = removed = 0
+        result = []
+        now = datetime.utcnow()
+
+        # 1. Проходим существующие: оставляем/обновляем/удаляем
+        for key, old in existing_by_key.items():
+            if key in discord_by_key:
+                # Матч всё ещё в Discord — проверяем не изменился ли текст
+                new = discord_by_key[key]
+                if old.text.strip() != new.text.strip():
+                    # Текст обновился (например дописали ставку) — обновляем
+                    old.text = new.text
+                    old.crooked_notified = False  # пересчитать кривизну
+                    updated += 1
+                result.append(old)
+            else:
+                # Матча нет в Discord
+                is_discord = (old.source == "discord")
+                not_started = old.match_time > now
+                if is_discord and not_started:
+                    # Удаляем (пропал из Discord, ещё не начался)
+                    removed += 1
+                    continue
+                else:
+                    # Ручной прогноз или уже начавшийся — оставляем
+                    result.append(old)
+
+        # 2. Добавляем новые матчи из Discord которых не было
+        for key, new in discord_by_key.items():
+            if key not in existing_by_key:
+                result.append(new)
+                added += 1
+
+        result.sort(key=lambda p: p.match_time)
+        data[SHARED_KEY] = [p.to_dict() for p in result]
+        gist_storage.write(FILE_PREDS, data)
+
+        logger.info(f"sync_from_discord: +{added} ~{updated} -{removed}")
+        return {"added": added, "updated": updated, "removed": removed}
+
+
 def update_prediction(chat_id: int = None, pred_id: str = None, **kwargs):
     with _lock:
         data = gist_storage.read(FILE_PREDS)

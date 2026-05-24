@@ -578,7 +578,7 @@ async def cmd_syncdiscord(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if ok:
-        await msg.edit_text(f"✅ Готово. {info}\n\nНовые прогнозы (если были) уже добавлены.")
+        await msg.edit_text(f"✅ Синхронизация завершена.\n\n{info}")
     else:
         await msg.edit_text(f"❌ {info}")
 
