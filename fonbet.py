@@ -603,6 +603,34 @@ def check_crookedness(pred_text: str, event: dict) -> Optional[dict]:
     }
 
 
+def has_relevant_odds(pred_text: str, event: dict) -> bool:
+    """
+    True если у события есть коэффициенты релевантные ставке прогноза.
+    Для победителя — есть П1 или П2. Для форы — найдена фора нужного значения.
+    """
+    bet = parse_bet_from_prediction(pred_text)
+    factors = event.get("factors", [])
+
+    if not bet or bet["type"] == "win":
+        return event.get("odd_p1") is not None or event.get("odd_p2") is not None
+
+    # Фора
+    value = bet["value"]
+    team = bet["team"]
+    if team == 1:
+        match_codes = HANDICAP_MATCH_TEAM1
+        half_code = {CODE_1STHALF_HANDICAP_T1_MINUS15}
+    else:
+        match_codes = HANDICAP_MATCH_TEAM2
+        half_code = {CODE_1STHALF_HANDICAP_T2_MINUS15}
+
+    if _find_factor(factors, match_codes, value) is not None:
+        return True
+    if abs(value) > 2.5 and _find_factor(factors, half_code, -1.5) is not None:
+        return True
+    return False
+
+
 def format_bet_odds(pred_text: str, event: dict) -> str:
     """
     Формирует строку коэффициентов под тип ставки из прогноза.
