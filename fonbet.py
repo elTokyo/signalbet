@@ -601,3 +601,48 @@ def check_crookedness(pred_text: str, event: dict) -> Optional[dict]:
         "odds_info": odds_info,
         "url": build_match_url(event),
     }
+
+
+def format_bet_odds(pred_text: str, event: dict) -> str:
+    """
+    Формирует строку коэффициентов под тип ставки из прогноза.
+    - Победитель → 'П1: x | П2: y'
+    - Фора → 'Ф1 -2.5: x' (+ фора 1 тайма -1.5 если большая фора)
+    Если ставку не распознать — показываем П1/П2 по умолчанию.
+    """
+    bet = parse_bet_from_prediction(pred_text)
+    factors = event.get("factors", [])
+
+    # По умолчанию (или для победителя) — П1/П2
+    def win_line():
+        p1 = event.get("odd_p1")
+        p2 = event.get("odd_p2")
+        p1s = f"{p1:.2f}" if p1 else "—"
+        p2s = f"{p2:.2f}" if p2 else "—"
+        return f"П1: {p1s}  |  П2: {p2s}"
+
+    if not bet or bet["type"] == "win":
+        return win_line()
+
+    # Фора
+    value = bet["value"]
+    team = bet["team"]
+    if team == 1:
+        match_codes = HANDICAP_MATCH_TEAM1
+        half_minus15_code = {CODE_1STHALF_HANDICAP_T1_MINUS15}
+    else:
+        match_codes = HANDICAP_MATCH_TEAM2
+        half_minus15_code = {CODE_1STHALF_HANDICAP_T2_MINUS15}
+
+    match_odd = _find_factor(factors, match_codes, value)
+    parts = []
+    mo = f"{match_odd:.2f}" if match_odd is not None else "—"
+    parts.append(f"Ф{team} {value:g} (матч): {mo}")
+
+    # Для большой форы (-3.5+) также показываем фору 1 тайма -1.5
+    if abs(value) > 2.5:
+        half_odd = _find_factor(factors, half_minus15_code, -1.5)
+        ho = f"{half_odd:.2f}" if half_odd is not None else "—"
+        parts.append(f"Ф{team} -1.5 (1й тайм): {ho}")
+
+    return "\n".join(parts)

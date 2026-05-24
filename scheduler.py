@@ -11,7 +11,7 @@ import auth
 from parser import format_reminder
 from fonbet import (
     fetch_events, find_matching_event, extract_teams_from_prediction,
-    check_crookedness, build_match_url,
+    check_crookedness, build_match_url, format_bet_odds,
 )
 
 import asyncio
@@ -174,7 +174,8 @@ async def _fonbet_tick_inner(app: Application):
 
         # Берём названия команд из ПРОГНОЗА (как просил)
         team1, team2 = extract_teams_from_prediction(pred.text)
-        odds_line = _format_odds(event.get("odd_p1"), event.get("odd_p2"))
+        # Коэффициенты под тип ставки (победитель → П1/П2, фора → кэф форы)
+        odds_line = format_bet_odds(pred.text, event)
         match_url = build_match_url(event)
 
         if event["is_live"] and not pred.fonbet_notified_live and pred.id not in _sent_live:
@@ -193,7 +194,10 @@ async def _fonbet_tick_inner(app: Application):
             logger.info(f"[fonbet live] {team1} — {team2}")
 
         elif (not event["is_live"]) and not pred.fonbet_notified_prematch and pred.id not in _sent_prematch:
-            has_odds = event.get("odd_p1") is not None or event.get("odd_p2") is not None
+            # Есть ли релевантные коэффициенты? Для форы проверяем что строка кэфов
+            # содержит число (не только прочерки).
+            odds_str = format_bet_odds(pred.text, event)
+            has_odds = any(c.isdigit() for c in odds_str)
             diff_min = (pred.match_time - now).total_seconds() / 60
             past_deadline = diff_min < -10
 
