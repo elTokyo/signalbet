@@ -205,7 +205,12 @@ def run_discord_listener():
             return
         if before.content == after.content:
             return
-        logger.info("Discord: обнаружено редактирование сообщения")
-        await _process_static(after.content, "edit")
+        logger.info("Discord: обнаружено редактирование — запускаю синхронизацию")
+        # Редактирование = возможно дописали ставку к существующему матчу.
+        # Полная синхронизация обновит текст вместо создания дубля.
+        try:
+            await _manual_recheck()
+        except Exception as e:
+            logger.error(f"on_message_edit sync error: {e}")
 
     client.run(config.DISCORD_TOKEN, log_handler=None)
