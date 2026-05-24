@@ -30,25 +30,25 @@ _client_ref: discord.Client | None = None
 _loop_ref = None
 
 
-def _is_from_today(message: discord.Message) -> bool:
-    """
-    True если сообщение создано ИЛИ отредактировано сегодня (по локальной дате).
-    Прогнозы публикуются строго на сегодня, поэтому вчерашние неубранные
-    сообщения должны игнорироваться, а отредактированные сегодня — обрабатываться.
-    """
-    tz = timezone(timedelta(hours=config.DEFAULT_TZ_OFFSET))
-    today = datetime.now(tz).date()
+# Окно «свежести» Discord-сообщения. Прогнозы на сегодняшние матчи могут
+# публиковаться накануне вечером, поэтому фильтр по календарной дате слишком жёсткий.
+# Берём сообщения за последние N часов — покрывает вечерние публикации накануне,
+# но отсекает действительно старые. Доп. защита от сыгранных матчей — в парсере.
+MESSAGE_FRESHNESS_HOURS = 18
 
-    # created_at и edited_at в discord.py — timezone-aware UTC
-    created = message.created_at.astimezone(tz).date()
-    if created == today:
+
+def _is_fresh(message: discord.Message) -> bool:
+    """
+    True если сообщение создано ИЛИ отредактировано за последние MESSAGE_FRESHNESS_HOURS часов.
+    Это покрывает прогнозы запощенные накануне вечером на сегодняшние матчи.
+    """
+    now = datetime.now(timezone.utc)
+    threshold = now - timedelta(hours=MESSAGE_FRESHNESS_HOURS)
+
+    if message.created_at >= threshold:
         return True
-
-    if message.edited_at is not None:
-        edited = message.edited_at.astimezone(tz).date()
-        if edited == today:
-            return True
-
+    if message.edited_at is not None and message.edited_at >= threshold:
+        return True
     return False
 
 
@@ -84,7 +84,7 @@ async def _manual_recheck() -> int:
     async for msg in ch.history(limit=RECHECK_HISTORY_LIMIT):
         if msg.author == _client_ref.user:
             continue
-        if not _is_from_today(msg):
+        if not _is_fresh(msg):
             continue  # пропускаем вчерашние неубранные прогнозы
         await _process_static(msg.content, "manual")
         count += 1
@@ -147,7 +147,7 @@ def run_discord_listener():
                 async for msg in ch.history(limit=RECHECK_HISTORY_LIMIT):
                     if msg.author == client.user:
                         continue
-                    if not _is_from_today(msg):
+                    if not _is_fresh(msg):
                         continue
                     await _process_static(msg.content, "recheck")
                     count += 1
@@ -175,7 +175,7 @@ def run_discord_listener():
             return
         if message.channel.id != config.DISCORD_CHANNEL_ID:
             return
-        if not _is_from_today(message):
+        if not _is_fresh(message):
             return
         await _process_static(message.content, "new")
 
