@@ -116,7 +116,12 @@ async def _notify_added(preds: list, label: str):
     """Шлёт уведомление о добавленных прогнозах с пометкой источника (в скобках)."""
     if not preds:
         return
-    recipients = storage.get_all_recipient_chat_ids()
+    all_recipients = storage.get_all_recipient_chat_ids()
+    # Только те у кого включены уведомления о новых прогнозах
+    recipients = [
+        rid for rid in all_recipients
+        if getattr(storage.load_settings(rid), "notify_new_preds", True)
+    ]
     if not recipients:
         return
     try:

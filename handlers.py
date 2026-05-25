@@ -238,21 +238,33 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⚠️ Очистить все прогнозы?", reply_markup=InlineKeyboardMarkup(kb))
 
 
+def _settings_keyboard(s):
+    """Строит клавиатуру настроек из текущих значений."""
+    def mark(v):
+        return "✅" if v else "☐"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🌐 Часовой пояс: UTC+{s.timezone_offset}", callback_data="set_tz")],
+        [InlineKeyboardButton(f"{mark(s.notify_reminders)} 🔔 Напоминания (30/5 мин)", callback_data="tg_reminders")],
+        [InlineKeyboardButton(f"{mark(s.notify_match_out)} 🔴 Выход матчей (Фонбет)", callback_data="tg_matchout")],
+        [InlineKeyboardButton(f"{mark(s.notify_crooked)} 💰 Кривые матчи", callback_data="tg_crooked")],
+        [InlineKeyboardButton(f"{mark(s.notify_new_preds)} 📥 Новые прогнозы", callback_data="tg_newpreds")],
+    ])
+
+
+_SETTINGS_TEXT = (
+    "⚙️ *Твои настройки уведомлений*\n\n"
+    "Нажми на пункт чтобы включить/выключить.\n"
+    "🌐 Часовой пояс — для отображения времени матчей."
+)
+
+
 @require_auth
 async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     s = storage.load_settings(user_id)
-    fb_label = "✅ ВКЛ" if s.fonbet_notifications else "☐ ВЫКЛ"
-    kb = [
-        [InlineKeyboardButton(f"🌐 Часовой пояс: UTC+{s.timezone_offset}", callback_data="set_tz")],
-        [InlineKeyboardButton(f"🔴 Уведомления Fonbet: {fb_label}", callback_data="toggle_fonbet")],
-    ]
     await update.message.reply_text(
-        "⚙️ *Твои настройки*\n\n"
-        "🌐 Часовой пояс — для отображения времени матчей.\n"
-        "🔴 Уведомления Fonbet — получать ли сигналы о выходе матчей.\n\n"
-        "_Уведомления о матчах приходят за 30 и 5 минут до старта._",
-        reply_markup=InlineKeyboardMarkup(kb),
+        _SETTINGS_TEXT,
+        reply_markup=_settings_keyboard(s),
         parse_mode="Markdown",
     )
 
@@ -822,22 +834,21 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
 
-    elif q.data == "toggle_fonbet":
-        # Персональная настройка по user_id
+    elif q.data in ("tg_reminders", "tg_matchout", "tg_crooked", "tg_newpreds"):
+        # Персональные тумблеры категорий уведомлений
         s = storage.load_settings(user_id)
-        s.fonbet_notifications = not s.fonbet_notifications
+        if q.data == "tg_reminders":
+            s.notify_reminders = not s.notify_reminders
+        elif q.data == "tg_matchout":
+            s.notify_match_out = not s.notify_match_out
+        elif q.data == "tg_crooked":
+            s.notify_crooked = not s.notify_crooked
+        elif q.data == "tg_newpreds":
+            s.notify_new_preds = not s.notify_new_preds
         storage.save_settings(s)
-        fb_label = "✅ ВКЛ" if s.fonbet_notifications else "☐ ВЫКЛ"
-        kb = [
-            [InlineKeyboardButton(f"🌐 Часовой пояс: UTC+{s.timezone_offset}", callback_data="set_tz")],
-            [InlineKeyboardButton(f"🔴 Уведомления Fonbet: {fb_label}", callback_data="toggle_fonbet")],
-        ]
         await q.edit_message_text(
-            "⚙️ *Твои настройки*\n\n"
-            "🌐 Часовой пояс — для отображения времени матчей.\n"
-            "🔴 Уведомления Fonbet — получать ли сигналы о выходе матчей.\n\n"
-            "_Уведомления о матчах приходят за 30 и 5 минут до старта._",
-            reply_markup=InlineKeyboardMarkup(kb),
+            _SETTINGS_TEXT,
+            reply_markup=_settings_keyboard(s),
             parse_mode="Markdown",
         )
 

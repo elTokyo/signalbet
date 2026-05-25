@@ -73,9 +73,14 @@ async def notification_tick(app: Application):
     if not predictions:
         return
 
-    recipients = storage.get_all_recipient_chat_ids()
-    if not recipients:
+    all_recipients = storage.get_all_recipient_chat_ids()
+    if not all_recipients:
         return
+    # Только те у кого включены напоминания
+    recipients = [
+        rid for rid in all_recipients
+        if getattr(storage.load_settings(rid), "notify_reminders", True)
+    ]
 
     changed = False
     kept = []
@@ -89,12 +94,14 @@ async def notification_tick(app: Application):
         diff_min = (pred.match_time - now).total_seconds() / 60
 
         if not pred.notified_30 and 28 <= diff_min <= 32:
-            await _broadcast(app, recipients, format_reminder(pred, 30))
+            if recipients:
+                await _broadcast(app, recipients, format_reminder(pred, 30))
             pred.notified_30 = True
             changed = True
 
         if not pred.notified_5 and 3 <= diff_min <= 7:
-            await _broadcast(app, recipients, format_reminder(pred, 5))
+            if recipients:
+                await _broadcast(app, recipients, format_reminder(pred, 5))
             pred.notified_5 = True
             changed = True
 
@@ -157,14 +164,17 @@ async def _fonbet_tick_inner(app: Application):
     if not events:
         return
 
-    # Получатели — только те, у кого включены уведомления Fonbet
     all_recipients = storage.get_all_recipient_chat_ids()
-    recipients = [
-        rid for rid in all_recipients
-        if storage.load_settings(rid).fonbet_notifications
-    ]
-    if not recipients:
+    if not all_recipients:
         return
+
+    # Хелперы: получатели по категории уведомления
+    def recipients_for(field: str) -> list[int]:
+        out = []
+        for rid in all_recipients:
+            if getattr(storage.load_settings(rid), field, True):
+                out.append(rid)
+        return out
 
     for pred in to_check:
         # Передаём ожидаемое время матча (UTC) для проверки соответствия
@@ -190,7 +200,7 @@ async def _fonbet_tick_inner(app: Application):
                 f"{team1} — {team2}\n"
                 f"{odds_line}"
             )
-            await _broadcast(app, recipients, msg, url=match_url)
+            await _broadcast(app, recipients_for("notify_match_out"), msg, url=match_url)
             logger.info(f"[fonbet live] {team1} — {team2}")
 
         elif (not event["is_live"]) and not pred.fonbet_notified_prematch and pred.id not in _sent_prematch:
@@ -209,7 +219,7 @@ async def _fonbet_tick_inner(app: Application):
                     f"{odds_line}\n\n"
                     f"📝 Прогноз:\n{pred.text}"
                 )
-                await _broadcast(app, recipients, msg, url=match_url)
+                await _broadcast(app, recipients_for("notify_match_out"), msg, url=match_url)
                 logger.info(f"[fonbet prematch] {team1} — {team2}")
             elif past_deadline:
                 _sent_prematch.add(pred.id)
@@ -221,7 +231,7 @@ async def _fonbet_tick_inner(app: Application):
                     f"(коэф. так и не появились)\n\n"
                     f"📝 Прогноз:\n{pred.text}"
                 )
-                await _broadcast(app, recipients, msg, url=match_url)
+                await _broadcast(app, recipients_for("notify_match_out"), msg, url=match_url)
                 logger.info(f"[fonbet prematch no-odds timeout] {team1} — {team2}")
             else:
                 logger.info(f"[fonbet prematch waiting odds] {team1} — {team2}")
@@ -240,7 +250,7 @@ async def _fonbet_tick_inner(app: Application):
                     f"⚡ {crooked['reason']}\n"
                     f"{crooked['odds_info']}"
                 )
-                await _broadcast(app, recipients, msg, url=crooked.get("url"))
+                await _broadcast(app, recipients_for("notify_crooked"), msg, url=crooked.get("url"))
                 logger.info(f"[fonbet CROOKED] {team1} — {team2}: {crooked['reason']}")
 
     # Флаги уже сохранены сразу после каждой отправки — финальное сохранение не нужно
