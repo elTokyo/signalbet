@@ -420,12 +420,23 @@ def find_matching_event(pred_text: str, events: list[dict],
         return None
 
     score, time_ok, event = chosen
-    logger.info(
-        f"Fonbet match [{score:.0f}%, {reason}]: "
-        f"'{pred_t1} vs {pred_t2}' → "
-        f"'{event['team1']} vs {event['team2']}' "
-        f"({'LIVE' if event['is_live'] else 'Prematch'})"
-    )
+
+    # Сомнительная зона: совпадение 75-88% И время не подтвердило (unknown/mismatch).
+    # Логируем отдельным WARNING чтобы можно было просмотреть потенциально ложные.
+    if score < 88 and time_ok is not True:
+        logger.warning(
+            f"⚠️ СОМНИТЕЛЬНОЕ совпадение [{score:.0f}%, {reason}]: "
+            f"'{pred_t1} vs {pred_t2}' → "
+            f"'{event['team1']} vs {event['team2']}' "
+            f"— проверь вручную"
+        )
+    else:
+        logger.info(
+            f"Fonbet match [{score:.0f}%, {reason}]: "
+            f"'{pred_t1} vs {pred_t2}' → "
+            f"'{event['team1']} vs {event['team2']}' "
+            f"({'LIVE' if event['is_live'] else 'Prematch'})"
+        )
     return event
 
 

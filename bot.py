@@ -84,6 +84,13 @@ def main():
     setup_scheduler(app)
     start_discord_in_background()
 
+    # Защита от нескольких инстансов — пишет heartbeat и предупреждает в логах
+    try:
+        import instance_guard
+        instance_guard.start()
+    except Exception as e:
+        logger.warning(f"Instance guard не запустился: {e}")
+
     logger.info("TG бот запущен")
     app.run_polling(allowed_updates=["message", "callback_query"])
 

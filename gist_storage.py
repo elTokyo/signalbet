@@ -26,6 +26,7 @@ HEADERS = {
 FILE_USERS       = "users.json"
 FILE_PREDICTIONS = "predictions.json"
 FILE_SETTINGS    = "settings.json"
+FILE_HEARTBEAT   = "heartbeat.json"
 
 # Кэш живёт 10 секунд. За это время делается обычно <50 операций → 6 запросов/мин к Gist
 CACHE_TTL = 10
@@ -139,3 +140,16 @@ def invalidate_cache():
     with _lock:
         _cache_time.clear()
         _cache.clear()
+
+
+# ── Heartbeat (детект нескольких инстансов) ──────────────────────────────────
+
+def read_heartbeat() -> dict:
+    """Читает heartbeat напрямую из Gist (без общего кэша файлов)."""
+    files = _fetch_gist()
+    return files.get(FILE_HEARTBEAT, {}) or {}
+
+
+def write_heartbeat(data: dict):
+    """Пишет heartbeat в Gist напрямую."""
+    _push_files({FILE_HEARTBEAT: data})
