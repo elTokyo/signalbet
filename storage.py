@@ -159,9 +159,11 @@ def sync_from_discord(discord_preds: list[Prediction]) -> dict:
                     result.append(old)
 
         # 2. Добавляем новые матчи из Discord которых не было
+        added_preds = []
         for key, new in discord_by_key.items():
             if key not in existing_by_key:
                 result.append(new)
+                added_preds.append(new)
                 added += 1
 
         result.sort(key=lambda p: p.match_time)
@@ -169,7 +171,10 @@ def sync_from_discord(discord_preds: list[Prediction]) -> dict:
         gist_storage.write(FILE_PREDS, data)
 
         logger.info(f"sync_from_discord: +{added} ~{updated} -{removed}")
-        return {"added": added, "updated": updated, "removed": removed}
+        return {
+            "added": added, "updated": updated, "removed": removed,
+            "added_preds": added_preds,   # сами добавленные прогнозы для уведомления
+        }
 
 
 def update_prediction(chat_id: int = None, pred_id: str = None, **kwargs):

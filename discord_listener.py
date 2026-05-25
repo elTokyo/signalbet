@@ -80,8 +80,11 @@ def trigger_manual_recheck() -> tuple[bool, str]:
         return False, f"Ошибка: {e}"
 
 
-async def _manual_recheck() -> int:
-    """Полная синхронизация листа со свежими сообщениями Discord."""
+async def _manual_recheck(label: str = "автопроверка") -> dict:
+    """
+    Полная синхронизация листа со свежими сообщениями Discord.
+    label — пометка источника для уведомления о добавленных прогнозах.
+    """
     ch = _client_ref.get_channel(config.DISCORD_CHANNEL_ID)
     if not ch:
         raise RuntimeError("канал не найден")
@@ -100,18 +103,19 @@ async def _manual_recheck() -> int:
 
     # Синхронизируем: добавить новые, обновить изменённые, удалить пропавшие
     stats = storage.sync_from_discord(all_preds)
+
+    # Уведомляем о добавленных прогнозах с пометкой источника
+    added_preds = stats.get("added_preds", [])
+    if added_preds:
+        await _notify_added(added_preds, label)
+
     return {"messages": msg_count, **stats}
 
 
-async def _process_static(content: str, origin: str):
-    """Обработка одного нового/отредактированного сообщения (on_message/on_message_edit)."""
-    preds = parse_predictions(content, config.DEFAULT_TZ_OFFSET, source="discord")
+async def _notify_added(preds: list, label: str):
+    """Шлёт уведомление о добавленных прогнозах с пометкой источника (в скобках)."""
     if not preds:
         return
-    added = storage.add_predictions(new_preds=preds)
-    if added <= 0:
-        return
-    logger.info(f"Discord [{origin}]: добавлено {added} новых прогнозов")
     recipients = storage.get_all_recipient_chat_ids()
     if not recipients:
         return
@@ -119,8 +123,8 @@ async def _process_static(content: str, origin: str):
         async with aiohttp.ClientSession() as session:
             for chat_id in recipients:
                 s = storage.load_settings(chat_id)
-                lines = [f"🤖 Из Discord: +{added} прогнозов"]
-                for p in preds[-added:]:
+                lines = [f"🤖 Из Discord: +{len(preds)} прогнозов ({label})"]
+                for p in preds:
                     t = format_time_local(p, s.timezone_offset)
                     lines.append(f"⏰ {t}  {p.text}")
                 try:
@@ -132,6 +136,19 @@ async def _process_static(content: str, origin: str):
                     logger.error(f"TG send to {chat_id} failed: {e}")
     except Exception as e:
         logger.error(f"Discord broadcast error: {e}")
+
+
+async def _process_static(content: str, origin: str, label: str = "новое сообщение"):
+    """Обработка одного нового сообщения (on_message)."""
+    preds = parse_predictions(content, config.DEFAULT_TZ_OFFSET, source="discord")
+    if not preds:
+        return
+    added = storage.add_predictions(new_preds=preds)
+    if added <= 0:
+        return
+    logger.info(f"Discord [{origin}]: добавлено {added} новых прогнозов")
+    # Берём именно добавленные (последние added) и уведомляем с пометкой
+    await _notify_added(preds[-added:], label)
 
 
 def run_discord_listener():
@@ -155,19 +172,9 @@ def run_discord_listener():
         while not client.is_closed():
             await asyncio.sleep(RECHECK_INTERVAL_SEC)
             try:
-                all_preds = []
-                msg_count = 0
-                async for msg in ch.history(limit=RECHECK_HISTORY_LIMIT):
-                    if msg.author == client.user:
-                        continue
-                    if not _is_fresh(msg):
-                        continue
-                    preds = parse_predictions(msg.content, config.DEFAULT_TZ_OFFSET, source="discord")
-                    all_preds.extend(preds)
-                    msg_count += 1
-                stats = storage.sync_from_discord(all_preds)
+                stats = await _manual_recheck("автопроверка")
                 logger.info(
-                    f"Discord periodic sync: сообщений {msg_count}, "
+                    f"Discord periodic sync: сообщений {stats['messages']}, "
                     f"+{stats['added']} ~{stats['updated']} -{stats['removed']}"
                 )
             except Exception as e:
@@ -206,10 +213,8 @@ def run_discord_listener():
         if before.content == after.content:
             return
         logger.info("Discord: обнаружено редактирование — запускаю синхронизацию")
-        # Редактирование = возможно дописали ставку к существующему матчу.
-        # Полная синхронизация обновит текст вместо создания дубля.
         try:
-            await _manual_recheck()
+            await _manual_recheck("изменённое сообщение")
         except Exception as e:
             logger.error(f"on_message_edit sync error: {e}")
 
