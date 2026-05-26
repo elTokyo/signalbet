@@ -30,22 +30,24 @@ _client_ref: discord.Client | None = None
 _loop_ref = None
 
 
-# Свежесть сообщения: обрабатываем только сообщения за сегодня (по локальной дате).
-# Защита от повторного добавления сыгранных матчей — в парсере (он игнорирует
-# уже начавшиеся discord-матчи). Это убирает повторный спам старыми прогнозами.
+# Окно свежести сообщения. Прогнозы постят вечером накануне (22-23 МСК),
+# матчи идут вечер/ночь/утро. Нужно окно покрывающее этот цикл, но не сутки+
+# (иначе сыгранные вчерашние добавятся снова). 14 часов — баланс.
+# Главная защита от повторного добавления сыгранных — в парсере (игнор начавшихся).
+MESSAGE_FRESHNESS_HOURS = 14
 
 
 def _is_fresh(message: discord.Message) -> bool:
     """
-    True если сообщение создано или отредактировано СЕГОДНЯ (по локальной дате).
-    Вчерашние неубранные сообщения игнорируются.
+    True если сообщение создано/отредактировано за последние MESSAGE_FRESHNESS_HOURS часов.
+    Покрывает вечерние публикации накануне на матчи следующего дня,
+    но отсекает сообщения старше суток.
     """
-    tz = timezone(timedelta(hours=config.DEFAULT_TZ_OFFSET))
-    today = datetime.now(tz).date()
-
-    if message.created_at.astimezone(tz).date() == today:
+    now = datetime.now(timezone.utc)
+    threshold = now - timedelta(hours=MESSAGE_FRESHNESS_HOURS)
+    if message.created_at >= threshold:
         return True
-    if message.edited_at is not None and message.edited_at.astimezone(tz).date() == today:
+    if message.edited_at is not None and message.edited_at >= threshold:
         return True
     return False
 
