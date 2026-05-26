@@ -30,24 +30,22 @@ _client_ref: discord.Client | None = None
 _loop_ref = None
 
 
-# Окно «свежести» Discord-сообщения. Прогнозы на сегодняшние матчи могут
-# публиковаться накануне вечером, поэтому фильтр по календарной дате слишком жёсткий.
-# Берём сообщения за последние N часов — покрывает вечерние публикации накануне,
-# но отсекает действительно старые. Доп. защита от сыгранных матчей — в парсере.
-MESSAGE_FRESHNESS_HOURS = 18
+# Свежесть сообщения: обрабатываем только сообщения за сегодня (по локальной дате).
+# Защита от повторного добавления сыгранных матчей — в парсере (он игнорирует
+# уже начавшиеся discord-матчи). Это убирает повторный спам старыми прогнозами.
 
 
 def _is_fresh(message: discord.Message) -> bool:
     """
-    True если сообщение создано ИЛИ отредактировано за последние MESSAGE_FRESHNESS_HOURS часов.
-    Это покрывает прогнозы запощенные накануне вечером на сегодняшние матчи.
+    True если сообщение создано или отредактировано СЕГОДНЯ (по локальной дате).
+    Вчерашние неубранные сообщения игнорируются.
     """
-    now = datetime.now(timezone.utc)
-    threshold = now - timedelta(hours=MESSAGE_FRESHNESS_HOURS)
+    tz = timezone(timedelta(hours=config.DEFAULT_TZ_OFFSET))
+    today = datetime.now(tz).date()
 
-    if message.created_at >= threshold:
+    if message.created_at.astimezone(tz).date() == today:
         return True
-    if message.edited_at is not None and message.edited_at >= threshold:
+    if message.edited_at is not None and message.edited_at.astimezone(tz).date() == today:
         return True
     return False
 

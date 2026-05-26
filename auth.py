@@ -49,13 +49,13 @@ class AuthorizedUser:
 def is_authorized(user_id: int) -> bool:
     """
     Админы всегда авторизованы.
-    Для остальных — читаем напрямую из Gist (минуя кэш), чтобы /remove
-    срабатывал моментально.
+    Для остальных — читаем из Gist (через кэш ~10 сек, чтобы не перегружать API).
+    После /remove пользователь блокируется в течение ~10 секунд (приемлемо).
     """
     if user_id in config.ADMIN_CHAT_IDS:
         return True
-    # Без кэша — гарантия что после /remove пользователь сразу заблокирован
-    gist_storage.invalidate_cache()
+    # Через кэш — снижает нагрузку на Gist API (раньше invalidate на каждое сообщение
+    # упирался в rate limit). Задержка применения /remove до 10 сек некритична.
     data = gist_storage.read(FILE)
     user = data.get(str(user_id))
     if not user:

@@ -176,6 +176,7 @@ async def _fonbet_tick_inner(app: Application):
                 out.append(rid)
         return out
 
+    changed = False
     for pred in to_check:
         # Передаём ожидаемое время матча (UTC) для проверки соответствия
         event = find_matching_event(pred.text, events, expected_utc=pred.match_time)
@@ -189,12 +190,12 @@ async def _fonbet_tick_inner(app: Application):
         match_url = build_match_url(event)
 
         if event["is_live"] and not pred.fonbet_notified_live and pred.id not in _sent_live:
-            # Помечаем ДО отправки чтобы параллельный тик не продублировал
+            # Помечаем в in-memory множествах ДО отправки (защита от дублей в процессе)
             _sent_live.add(pred.id)
             _sent_prematch.add(pred.id)
             pred.fonbet_notified_live = True
             pred.fonbet_notified_prematch = True
-            storage.save_predictions(predictions=predictions)  # сохраняем флаг сразу
+            changed = True
             msg = (
                 f"🔴 Матч вышел в лайв!\n"
                 f"{team1} — {team2}\n"
@@ -212,7 +213,7 @@ async def _fonbet_tick_inner(app: Application):
             if has_odds:
                 _sent_prematch.add(pred.id)
                 pred.fonbet_notified_prematch = True
-                storage.save_predictions(predictions=predictions)
+                changed = True
                 msg = (
                     f"📋 Матч вышел в прематч!\n"
                     f"{team1} — {team2}\n"
@@ -224,7 +225,7 @@ async def _fonbet_tick_inner(app: Application):
             elif past_deadline:
                 _sent_prematch.add(pred.id)
                 pred.fonbet_notified_prematch = True
-                storage.save_predictions(predictions=predictions)
+                changed = True
                 msg = (
                     f"📋 Матч вышел в прематч!\n"
                     f"{team1} — {team2}\n"
@@ -242,7 +243,7 @@ async def _fonbet_tick_inner(app: Application):
             if crooked:
                 _sent_crooked.add(pred.id)
                 pred.crooked_notified = True
-                storage.save_predictions(predictions=predictions)
+                changed = True
                 status = "🔴 LIVE" if crooked["is_live"] else "📋 Прематч"
                 msg = (
                     f"💰 КРИВОЙ МАТЧ! ({status})\n"
@@ -253,7 +254,9 @@ async def _fonbet_tick_inner(app: Application):
                 await _broadcast(app, recipients_for("notify_crooked"), msg, url=crooked.get("url"))
                 logger.info(f"[fonbet CROOKED] {team1} — {team2}: {crooked['reason']}")
 
-    # Флаги уже сохранены сразу после каждой отправки — финальное сохранение не нужно
+    # Сохраняем флаги ОДИН раз в конце тика (батч) — снижает нагрузку на Gist API
+    if changed:
+        storage.save_predictions(predictions=predictions)
 
 
 def _format_odds(odd_p1, odd_p2) -> str:

@@ -22,11 +22,11 @@ logger = logging.getLogger(__name__)
 # Уникальный ID этого процесса
 INSTANCE_ID = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
-# Как часто обновлять heartbeat (секунды)
-HEARTBEAT_INTERVAL = 30
+# Как часто обновлять heartbeat (секунды). Реже = меньше нагрузка на Gist API.
+HEARTBEAT_INTERVAL = 120
 
 # Если чужой heartbeat свежее этого порога — считаем что инстанс активен
-STALE_THRESHOLD = 90
+STALE_THRESHOLD = 300
 
 _stop = threading.Event()
 
