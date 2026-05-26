@@ -240,6 +240,31 @@ def load_settings(chat_id: int) -> UserSettings:
 
 def save_settings(settings: UserSettings):
     with _lock:
+        gist_storage.invalidate_cache()
         data = gist_storage.read(FILE_SETTINGS)
         data[str(settings.chat_id)] = settings.to_dict()
         gist_storage.write(FILE_SETTINGS, data)
+
+
+def toggle_setting(user_id: int, field: str) -> UserSettings:
+    """
+    Атомарно переключает булево поле настроек.
+    Читает СВЕЖИЕ данные (минуя кэш), меняет одно поле, сохраняет.
+    Защищает от затирания при быстрых нажатиях тумблеров.
+    Возвращает обновлённые настройки.
+    """
+    with _lock:
+        gist_storage.invalidate_cache()
+        data = gist_storage.read(FILE_SETTINGS)
+        raw = data.get(str(user_id))
+        if raw:
+            s = UserSettings.from_dict(raw)
+        else:
+            s = UserSettings(chat_id=user_id, timezone_offset=config.DEFAULT_TZ_OFFSET)
+
+        current = getattr(s, field, True)
+        setattr(s, field, not current)
+
+        data[str(user_id)] = s.to_dict()
+        gist_storage.write(FILE_SETTINGS, data)
+        return s

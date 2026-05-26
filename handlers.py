@@ -835,17 +835,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
     elif q.data in ("tg_reminders", "tg_matchout", "tg_crooked", "tg_newpreds"):
-        # Персональные тумблеры категорий уведомлений
-        s = storage.load_settings(user_id)
-        if q.data == "tg_reminders":
-            s.notify_reminders = not s.notify_reminders
-        elif q.data == "tg_matchout":
-            s.notify_match_out = not s.notify_match_out
-        elif q.data == "tg_crooked":
-            s.notify_crooked = not s.notify_crooked
-        elif q.data == "tg_newpreds":
-            s.notify_new_preds = not s.notify_new_preds
-        storage.save_settings(s)
+        # Атомарное переключение — защита от затирания при быстрых нажатиях
+        field_map = {
+            "tg_reminders": "notify_reminders",
+            "tg_matchout": "notify_match_out",
+            "tg_crooked": "notify_crooked",
+            "tg_newpreds": "notify_new_preds",
+        }
+        s = storage.toggle_setting(user_id, field_map[q.data])
         await q.edit_message_text(
             _SETTINGS_TEXT,
             reply_markup=_settings_keyboard(s),
