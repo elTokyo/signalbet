@@ -391,9 +391,12 @@ def find_matching_event(pred_text: str, events: list[dict],
         return None
 
     # Приоритет:
-    # 1. Совпало время (time_ok=True) — берём с лучшим score среди таких
-    # 2. Время проверить не смогли (time_ok=None) — берём если score высокий
-    # 3. Время НЕ совпало (time_ok=False) — берём только если score почти идеальный (>=95)
+    # 1. Совпало время (time_ok=True) — берём с лучшим score
+    # 2. Время неизвестно (time_ok=None) — берём с лучшим score (>=FUZZY_THRESHOLD)
+    # 3. Время НЕ совпало (time_ok=False) — берём при высоком fuzzy (>=85),
+    #    при низком (75-85) — только если совсем нет других кандидатов с подтверждённым временем.
+    # Цель: проверка времени НЕ должна резать матчи (как раньше при >=95).
+    # Она лишь помогает выбрать ЛУЧШЕГО из нескольких кандидатов и предупредить в логах.
 
     time_matched = [c for c in candidates if c[1] is True]
     time_unknown = [c for c in candidates if c[1] is None]
@@ -409,12 +412,13 @@ def find_matching_event(pred_text: str, events: list[dict],
             chosen = best
             reason = "команды (время неизвестно)"
     elif time_mismatch:
-        # Время не совпало — высокий риск ложного матча (U20 vs основа).
-        # Берём ТОЛЬКО при почти идеальном совпадении названий.
+        # Время не совпало. Берём с лучшим fuzzy — защита U20/основа теперь
+        # держится на самом fuzzy: похожие названия U20 vs основа дают разный
+        # token_sort_ratio, и порог FUZZY_THRESHOLD=80 их разводит.
         best = max(time_mismatch, key=lambda c: c[0])
-        if best[0] >= 95:
+        if best[0] >= FUZZY_THRESHOLD:
             chosen = best
-            reason = "только команды (ВРЕМЯ НЕ СОВПАЛО!)"
+            reason = "команды (время Fonbet отличается)"
 
     if not chosen:
         return None
