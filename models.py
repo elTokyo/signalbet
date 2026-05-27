@@ -14,6 +14,7 @@ class Prediction:
     fonbet_notified_prematch: bool = False
     fonbet_notified_live: bool = False
     crooked_notified: bool = False
+    leon_notified: bool = False
     source: str = "manual"
 
     def to_dict(self) -> dict:
@@ -26,6 +27,7 @@ class Prediction:
             "fonbet_notified_prematch": self.fonbet_notified_prematch,
             "fonbet_notified_live": self.fonbet_notified_live,
             "crooked_notified": self.crooked_notified,
+            "leon_notified": self.leon_notified,
             "source": self.source,
         }
 
@@ -40,6 +42,7 @@ class Prediction:
             fonbet_notified_prematch=d.get("fonbet_notified_prematch", False),
             fonbet_notified_live=d.get("fonbet_notified_live", False),
             crooked_notified=d.get("crooked_notified", False),
+            leon_notified=d.get("leon_notified", False),
             source=d.get("source", "manual"),
         )
 

@@ -1,0 +1,194 @@
+"""
+Леон (leon.ru) — клиент для поиска победителя когда на Фонбете нет чистой П1/П2.
+
+Используется как вторичный источник: когда прогноз на победу команды,
+а Фонбет открыл матч без рынка чистой победы (только 1X/12 и т.п.),
+бот ищет матч на Леоне и проверяет есть ли там П1/П2 на нужную команду.
+
+API:
+- betline/changes/all?family=Soccer — полный список футбольных событий с рынками
+- Рынок "Победитель" (marketTypeId известен), runners с тегами HOME/AWAY/DRAW и price.
+"""
+import time
+import logging
+import threading
+import requests
+from typing import Optional
+from fuzzywuzzy import fuzz
+
+logger = logging.getLogger(__name__)
+
+BASE_URL = "https://leon.ru/api-2/betline/changes/all"
+PARAMS = {
+    "ctag": "ru-RU",
+    "flags": "reg,urlv2,orn2,mm2,rrc,nodup,cmg",
+    "family": "Soccer",
+}
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+}
+
+FUZZY_THRESHOLD = 80      # порог совпадения команд
+CACHE_TTL = 20            # кэш списка событий 20 сек
+_cache = {"events": None, "ts": 0}
+_lock = threading.RLock()
+
+
+def fetch_events() -> list[dict]:
+    """
+    Запрашивает все футбольные события Леона.
+    Возвращает список: {team1, team2, kickoff_utc, win1, win2, is_live}
+    win1/win2 — кэф на чистую победу команды 1/2 (или None если рынка нет).
+    """
+    with _lock:
+        now = time.time()
+        if _cache["events"] is not None and (now - _cache["ts"]) < CACHE_TTL:
+            return _cache["events"]
+
+    try:
+        r = requests.get(BASE_URL, params=PARAMS, headers=HEADERS, timeout=15)
+        if r.status_code != 200:
+            logger.warning(f"Leon API {r.status_code}")
+            return []
+        data = r.json()
+    except Exception as e:
+        logger.error(f"Leon fetch error: {e}")
+        return []
+
+    result = []
+    for ev in data.get("data", []):
+        comps = ev.get("competitors", [])
+        if len(comps) < 2:
+            continue
+        team1 = next((c["name"] for c in comps if c.get("homeAway") == "HOME"), None)
+        team2 = next((c["name"] for c in comps if c.get("homeAway") == "AWAY"), None)
+        if not team1 or not team2:
+            continue
+
+        # Ищем рынок "Победитель" (primary 1X2 основного времени)
+        win1 = win2 = None
+        for m in ev.get("markets", []):
+            name = (m.get("name") or "").lower()
+            # Основной исход 1Х2 (не тайм, не период)
+            if m.get("primary") and ("1х2" in name or "исход" in name):
+                for run in m.get("runners", []):
+                    tags = run.get("tags", [])
+                    if "HOME" in tags:
+                        win1 = run.get("price")
+                    elif "AWAY" in tags:
+                        win2 = run.get("price")
+                break
+
+        kickoff_ms = ev.get("kickoff")
+        kickoff_utc = None
+        if kickoff_ms:
+            from datetime import datetime
+            try:
+                kickoff_utc = datetime.utcfromtimestamp(int(kickoff_ms) / 1000)
+            except (ValueError, TypeError, OSError):
+                kickoff_utc = None
+
+        result.append({
+            "team1": team1,
+            "team2": team2,
+            "kickoff_utc": kickoff_utc,
+            "win1": win1,
+            "win2": win2,
+            "is_live": ev.get("betline") == "inplay",
+        })
+
+    with _lock:
+        _cache["events"] = result
+        _cache["ts"] = time.time()
+
+    logger.info(f"Leon: получено {len(result)} футбольных событий")
+    return result
+
+
+def find_win_odds(pred_t1: str, pred_t2: str, team_num: int,
+                  expected_utc=None, time_tolerance_min: int = 15) -> Optional[dict]:
+    """
+    Ищет матч на Леоне по названиям команд и возвращает кэф на победу нужной команды.
+
+    pred_t1, pred_t2 — команды из прогноза.
+    team_num — на какую команду ставка (1 или 2).
+    expected_utc — ожидаемое время матча (для верификации).
+
+    Возвращает {odd, team1, team2, is_live} или None если матч/кэф не найден.
+    """
+    if not pred_t1:
+        return None
+
+    events = fetch_events()
+    if not events:
+        return None
+
+    p1 = pred_t1.lower()
+    p2 = (pred_t2 or "").lower()
+
+    best = None
+    best_score = 0
+    best_time_ok = None
+
+    for ev in events:
+        e1 = ev["team1"].lower()
+        e2 = ev["team2"].lower()
+        if p2:
+            direct = (fuzz.token_sort_ratio(p1, e1) + fuzz.token_sort_ratio(p2, e2)) / 2
+            reverse = (fuzz.token_sort_ratio(p1, e2) + fuzz.token_sort_ratio(p2, e1)) / 2
+            # учитываем порядок: какая ориентация лучше
+            if direct >= reverse:
+                score, swapped = direct, False
+            else:
+                score, swapped = reverse, True
+        else:
+            score, swapped = fuzz.token_sort_ratio(p1, e1), False
+
+        if score < FUZZY_THRESHOLD or score <= best_score:
+            continue
+
+        # Верификация времени
+        time_ok = None
+        if expected_utc is not None and ev.get("kickoff_utc"):
+            diff_min = abs((ev["kickoff_utc"] - expected_utc).total_seconds()) / 60
+            time_ok = diff_min <= time_tolerance_min
+            # Если время не совпало — требуем почти идеальное совпадение
+            if not time_ok and score < 95:
+                continue
+
+        best = (ev, swapped)
+        best_score = score
+        best_time_ok = time_ok
+
+    if not best:
+        return None
+
+    ev, swapped = best
+    # Определяем кэф на нужную команду из прогноза.
+    # Если команды в Леоне поменяны местами относительно прогноза (swapped) —
+    # инвертируем какой win брать.
+    if team_num == 1:
+        odd = ev["win2"] if swapped else ev["win1"]
+    else:
+        odd = ev["win1"] if swapped else ev["win2"]
+
+    if odd is None:
+        return None
+
+    logger.info(
+        f"Leon match [{best_score:.0f}%, time_ok={best_time_ok}]: "
+        f"'{pred_t1} vs {pred_t2}' → '{ev['team1']} vs {ev['team2']}', "
+        f"П{team_num}={odd}"
+    )
+    return {
+        "odd": odd,
+        "team1": ev["team1"],
+        "team2": ev["team2"],
+        "is_live": ev["is_live"],
+    }

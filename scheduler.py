@@ -12,7 +12,9 @@ from parser import format_reminder
 from fonbet import (
     fetch_events, find_matching_event, extract_teams_from_prediction,
     check_crookedness, build_match_url, format_bet_odds, has_relevant_odds,
+    parse_bet_from_prediction,
 )
+import leon
 
 import asyncio
 
@@ -37,6 +39,7 @@ _tick_counter = 0
 _sent_prematch: set = set()
 _sent_live: set = set()
 _sent_crooked: set = set()
+_sent_leon: set = set()
 
 # Лок чтобы тики не накладывались друг на друга (тик может длиться >15 сек)
 _fonbet_lock = asyncio.Lock()
@@ -253,6 +256,40 @@ async def _fonbet_tick_inner(app: Application):
                 )
                 await _broadcast(app, recipients_for("notify_crooked"), msg, url=crooked.get("url"))
                 logger.info(f"[fonbet CROOKED] {team1} — {team2}: {crooked['reason']}")
+
+        # ── Леон: поиск победы команды когда на Фонбете нет чистой П1/П2 ──
+        if not pred.leon_notified and pred.id not in _sent_leon:
+            bet = parse_bet_from_prediction(pred.text)
+            if bet and bet["type"] == "win":
+                # На какую команду ставка, и есть ли её кэф у Фонбета?
+                fonbet_win = event.get("odd_p1") if bet["team"] == 1 else event.get("odd_p2")
+                if fonbet_win is None:
+                    # У Фонбета НЕТ чистой победы нужной команды → идём на Леон
+                    try:
+                        leon_res = leon.find_win_odds(
+                            team1, team2, bet["team"],
+                            expected_utc=pred.match_time,
+                        )
+                    except Exception as e:
+                        leon_res = None
+                        logger.error(f"Leon lookup error: {e}")
+
+                    if leon_res and leon_res.get("odd"):
+                        _sent_leon.add(pred.id)
+                        pred.leon_notified = True
+                        changed = True
+                        msg = (
+                            f"🦁 Леон даёт победу!\n"
+                            f"{team1} — {team2}\n"
+                            f"На Фонбете нет чистой П{bet['team']}, "
+                            f"а на Леоне есть:\n"
+                            f"П{bet['team']} = {leon_res['odd']:.2f}"
+                        )
+                        await _broadcast(app, recipients_for("notify_match_out"), msg)
+                        logger.info(
+                            f"[leon WIN] {team1} — {team2}: "
+                            f"П{bet['team']}={leon_res['odd']}"
+                        )
 
     # Сохраняем флаги ОДИН раз в конце тика (батч) — снижает нагрузку на Gist API
     if changed:
