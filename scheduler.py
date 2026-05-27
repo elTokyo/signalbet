@@ -15,6 +15,7 @@ from fonbet import (
     parse_bet_from_prediction,
 )
 import leon
+import betcity
 
 import asyncio
 
@@ -257,38 +258,51 @@ async def _fonbet_tick_inner(app: Application):
                 await _broadcast(app, recipients_for("notify_crooked"), msg, url=crooked.get("url"))
                 logger.info(f"[fonbet CROOKED] {team1} — {team2}: {crooked['reason']}")
 
-        # ── Леон: поиск победы команды когда на Фонбете нет чистой П1/П2 ──
+        # ── Поиск победы на других БК когда на Фонбете нет чистой П1/П2 ──
+        # Каскад: Леон → если не нашёл → БетСити → (далее Лига Ставок)
         if not pred.leon_notified and pred.id not in _sent_leon:
             bet = parse_bet_from_prediction(pred.text)
             if bet and bet["type"] == "win":
-                # На какую команду ставка, и есть ли её кэф у Фонбета?
                 fonbet_win = event.get("odd_p1") if bet["team"] == 1 else event.get("odd_p2")
                 if fonbet_win is None:
-                    # У Фонбета НЕТ чистой победы нужной команды → идём на Леон
+                    # У Фонбета НЕТ чистой победы нужной команды → ищем на других БК
+                    found = None
+                    bk_name = None
+
+                    # 1. Леон
                     try:
-                        leon_res = leon.find_win_odds(
-                            team1, team2, bet["team"],
-                            expected_utc=pred.match_time,
-                        )
+                        found = leon.find_win_odds(team1, team2, bet["team"],
+                                                   expected_utc=pred.match_time)
+                        if found:
+                            bk_name = "Леон"
                     except Exception as e:
-                        leon_res = None
                         logger.error(f"Leon lookup error: {e}")
 
-                    if leon_res and leon_res.get("odd"):
+                    # 2. БетСити (если Леон не нашёл)
+                    if not found:
+                        try:
+                            found = betcity.find_win_odds(team1, team2, bet["team"],
+                                                          expected_utc=pred.match_time)
+                            if found:
+                                bk_name = "БетСити"
+                        except Exception as e:
+                            logger.error(f"BetCity lookup error: {e}")
+
+                    if found and found.get("odd"):
                         _sent_leon.add(pred.id)
                         pred.leon_notified = True
                         changed = True
                         msg = (
-                            f"🦁 Леон даёт победу!\n"
+                            f"🎯 Победа есть на {bk_name}!\n"
                             f"{team1} — {team2}\n"
                             f"На Фонбете нет чистой П{bet['team']}, "
-                            f"а на Леоне есть:\n"
-                            f"П{bet['team']} = {leon_res['odd']:.2f}"
+                            f"а на {bk_name} есть:\n"
+                            f"П{bet['team']} = {found['odd']:.2f}"
                         )
                         await _broadcast(app, recipients_for("notify_match_out"), msg)
                         logger.info(
-                            f"[leon WIN] {team1} — {team2}: "
-                            f"П{bet['team']}={leon_res['odd']}"
+                            f"[{bk_name} WIN] {team1} — {team2}: "
+                            f"П{bet['team']}={found['odd']}"
                         )
 
     # Сохраняем флаги ОДИН раз в конце тика (батч) — снижает нагрузку на Gist API
