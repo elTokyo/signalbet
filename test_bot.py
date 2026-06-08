@@ -194,6 +194,23 @@ def test_has_odds():
     check("Победитель с коэф → True", fonbet.has_relevant_odds("A — B п1 4+", ev) is True)
 
 
+def test_age_markers():
+    print("\n[Возрастные маркеры]")
+
+    check("(20) → u20", fonbet.extract_age_marker("Atletico (20) — Fast (20)") == "u20")
+    check("U23 → u23", fonbet.extract_age_marker("Brazil U23. Sao Paulo — Santos") == "u23")
+    check("основа → None", fonbet.extract_age_marker("Atletico — Fast") is None)
+    check("W → women", fonbet.extract_age_marker("Lyon W — PSG W") == "women")
+
+    # Главное: прогноз с возрастом НЕ совместим с событием-основой
+    check("U20 prog ≠ основа event",
+          fonbet._age_markers_compatible("Atletico (20) — Fast (20)", "Atletico", "Fast") is False)
+    check("U20 prog = U20 event",
+          fonbet._age_markers_compatible("Atletico (20) — Fast (20)", "Atletico U20", "Fast U20") is True)
+    check("основа prog ≠ U20 event",
+          fonbet._age_markers_compatible("Atletico — Fast", "Atletico U20", "Fast U20") is False)
+
+
 if __name__ == "__main__":
     print("=" * 50)
     print("ТЕСТЫ BET BOT")
@@ -205,6 +222,7 @@ if __name__ == "__main__":
     test_crookedness()
     test_url()
     test_has_odds()
+    test_age_markers()
 
     print("\n" + "=" * 50)
     print(f"Пройдено: {_passed}  |  Провалено: {_failed}")

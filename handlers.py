@@ -538,7 +538,7 @@ async def cmd_checkfonbet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         found_count = 0
         for pred in predictions:
             team1, team2 = fonbet.extract_teams_from_prediction(pred.text)
-            event = fonbet.find_matching_event(pred.text, events)
+            event = fonbet.find_matching_event(pred.text, events, expected_utc=pred.match_time)
 
             if event:
                 found_count += 1

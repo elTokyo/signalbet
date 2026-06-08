@@ -336,6 +336,64 @@ def extract_teams_from_prediction(text: str) -> tuple[str, str]:
     return team1, team2
 
 
+def extract_age_marker(text: str) -> Optional[str]:
+    """
+    Извлекает возрастной/категорийный маркер из названия команды или прогноза.
+    Возвращает нормализованный маркер или None если это основной состав.
+
+    Распознаёт: U17/U18/U19/U20/U21/U23 (и варианты "до 20", "(20)", "мол"),
+    дубли (II, "2", дубль, B), женские (W, ж, women, женщины).
+    Несколько маркеров склеиваются (напр. "u20" + "w" → "u20|w").
+    """
+    t = text.lower()
+    markers = set()
+
+    # Возраст: u20, u-20, "до 20 лет", "(20)", "20 (год.)"
+    import re as _re2
+    # u17..u23 в разных написаниях
+    for m in _re2.finditer(r'\bu[\s\-]?(\d{2})\b', t):
+        markers.add(f"u{m.group(1)}")
+    # "до NN" (лет)
+    for m in _re2.finditer(r'до\s*(\d{2})', t):
+        markers.add(f"u{m.group(1)}")
+    # "(NN)" в скобках — частый формат: "Atletico (20)"
+    for m in _re2.finditer(r'\((\d{2})\)', t):
+        age = m.group(1)
+        if age in ("17", "18", "19", "20", "21", "23"):
+            markers.add(f"u{age}")
+    # молодёжная
+    if _re2.search(r'\bмолод|\bmolod|\byouth\b|\bjunior|\bjuv\b', t):
+        markers.add("youth")
+
+    # Женский
+    if _re2.search(r'\bw\b|\(w\)|\bжен|\bwomen|\bgirls\b|\(ж\)|\bж\b', t):
+        markers.add("women")
+
+    # Дубль / вторая команда / резерв
+    if _re2.search(r'\bдубль|\breserve|\bрезерв|\bii\b|\bb\b|\(2\)|\b2\b(?!\d)', t):
+        # осторожно: "2" может быть частью названия. Берём только явные дубль-маркеры.
+        if _re2.search(r'\bдубль|\breserve|\bрезерв|\bii\b|\(2\)', t):
+            markers.add("reserve")
+
+    if not markers:
+        return None
+    return "|".join(sorted(markers))
+
+
+def _age_markers_compatible(pred_text: str, ev_team1: str, ev_team2: str) -> bool:
+    """
+    Проверяет совместимость возрастных маркеров прогноза и события.
+    Маркер прогноза должен СОВПАДАТЬ с маркером события.
+    - прогноз U20, событие U20 → OK
+    - прогноз U20, событие без маркера (основа) → НЕ ОК
+    - прогноз без маркера (основа), событие U20 → НЕ ОК
+    - оба без маркера → OK
+    """
+    pred_marker = extract_age_marker(pred_text)
+    ev_marker = extract_age_marker(f"{ev_team1} {ev_team2}")
+    return pred_marker == ev_marker
+
+
 def find_matching_event(pred_text: str, events: list[dict],
                         expected_utc=None, time_tolerance_min: int = 15) -> Optional[dict]:
     """
@@ -359,7 +417,7 @@ def find_matching_event(pred_text: str, events: list[dict],
     p1 = pred_t1.lower()
     p2 = pred_t2.lower() if pred_t2 else ""
 
-    candidates = []  # (score, time_ok, event)
+    candidates = []  # (score, event)
 
     for ev in events:
         e1 = ev["team1"].lower()
@@ -375,72 +433,46 @@ def find_matching_event(pred_text: str, events: list[dict],
         if score < FUZZY_THRESHOLD:
             continue
 
-        # Проверка времени старта
-        time_ok = None  # None = не смогли проверить
-        if expected_utc is not None and ev.get("start_time"):
+        # ── ОБЯЗАТЕЛЬНАЯ проверка 1: возрастной/категорийный маркер ──
+        # Если в прогнозе U20, а событие про основу (или наоборот) — отвергаем.
+        if not _age_markers_compatible(pred_text, ev["team1"], ev["team2"]):
+            continue
+
+        # ── ОБЯЗАТЕЛЬНАЯ проверка 2: время старта ──
+        # Время ДОЛЖНО совпасть (±tolerance). Если у события нет времени или
+        # оно не совпадает — отвергаем. Это убирает путаницу разных фикстур
+        # одних и тех же команд.
+        if expected_utc is None:
+            # Нет ожидаемого времени (например /checkfonbet) — пропускаем проверку времени
+            time_ok = True
+        else:
+            ev_start_raw = ev.get("start_time")
+            if not ev_start_raw:
+                # У события нет времени — не можем подтвердить, отвергаем
+                continue
             try:
-                ev_start = _dt.datetime.utcfromtimestamp(int(ev["start_time"]))
+                ev_start = _dt.datetime.utcfromtimestamp(int(ev_start_raw))
                 diff_min = abs((ev_start - expected_utc).total_seconds()) / 60
                 time_ok = diff_min <= time_tolerance_min
             except (ValueError, TypeError, OSError):
-                time_ok = None
+                continue
+            if not time_ok:
+                continue
 
-        candidates.append((score, time_ok, ev))
+        candidates.append((score, ev))
 
     if not candidates:
         return None
 
-    # Приоритет:
-    # 1. Совпало время (time_ok=True) — берём с лучшим score
-    # 2. Время неизвестно (time_ok=None) — берём с лучшим score (>=FUZZY_THRESHOLD)
-    # 3. Время НЕ совпало (time_ok=False) — берём при высоком fuzzy (>=85),
-    #    при низком (75-85) — только если совсем нет других кандидатов с подтверждённым временем.
-    # Цель: проверка времени НЕ должна резать матчи (как раньше при >=95).
-    # Она лишь помогает выбрать ЛУЧШЕГО из нескольких кандидатов и предупредить в логах.
+    # Берём кандидата с лучшим совпадением названий (возраст и время уже проверены)
+    score, event = max(candidates, key=lambda c: c[0])
 
-    time_matched = [c for c in candidates if c[1] is True]
-    time_unknown = [c for c in candidates if c[1] is None]
-    time_mismatch = [c for c in candidates if c[1] is False]
-
-    chosen = None
-    if time_matched:
-        chosen = max(time_matched, key=lambda c: c[0])
-        reason = "время+команды"
-    elif time_unknown:
-        best = max(time_unknown, key=lambda c: c[0])
-        if best[0] >= FUZZY_THRESHOLD:
-            chosen = best
-            reason = "команды (время неизвестно)"
-    elif time_mismatch:
-        # Время не совпало. Берём с лучшим fuzzy — защита U20/основа теперь
-        # держится на самом fuzzy: похожие названия U20 vs основа дают разный
-        # token_sort_ratio, и порог FUZZY_THRESHOLD=80 их разводит.
-        best = max(time_mismatch, key=lambda c: c[0])
-        if best[0] >= FUZZY_THRESHOLD:
-            chosen = best
-            reason = "команды (время Fonbet отличается)"
-
-    if not chosen:
-        return None
-
-    score, time_ok, event = chosen
-
-    # Сомнительная зона: совпадение 75-88% И время не подтвердило (unknown/mismatch).
-    # Логируем отдельным WARNING чтобы можно было просмотреть потенциально ложные.
-    if score < 88 and time_ok is not True:
-        logger.warning(
-            f"⚠️ СОМНИТЕЛЬНОЕ совпадение [{score:.0f}%, {reason}]: "
-            f"'{pred_t1} vs {pred_t2}' → "
-            f"'{event['team1']} vs {event['team2']}' "
-            f"— проверь вручную"
-        )
-    else:
-        logger.info(
-            f"Fonbet match [{score:.0f}%, {reason}]: "
-            f"'{pred_t1} vs {pred_t2}' → "
-            f"'{event['team1']} vs {event['team2']}' "
-            f"({'LIVE' if event['is_live'] else 'Prematch'})"
-        )
+    logger.info(
+        f"Fonbet match [{score:.0f}%, возраст+время+команды]: "
+        f"'{pred_t1} vs {pred_t2}' → "
+        f"'{event['team1']} vs {event['team2']}' "
+        f"({'LIVE' if event['is_live'] else 'Prematch'})"
+    )
     return event
 
 
