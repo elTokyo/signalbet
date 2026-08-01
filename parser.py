@@ -9,16 +9,21 @@ TRIGGERS = ("футбол.", "soccer.", "футбол ", "soccer ")
 # Старый формат целиком начинается с "Футбол"/"Soccer" (без учёта регистра)
 _OLD_FORMAT_TRIGGER = re.compile(r'(?i)^\s*(?:футбол|soccer)[\.\s]')
 
-# Новый формат: "Страна. Лига. <любой текст без точек> HH-MM/HH:MM ..."
-# Пример: "Poland. 4 Liga. Warmia-Masuria Voivodeship 16-00 Sokol Ostroda — DKS Dobre Miasto 7+"
+# Новый формат: "Страна.[ Лига.] <любой текст без точек> HH-MM/HH:MM ..."
+# Примеры:
+#   "Poland. 4 Liga. Warmia-Masuria Voivodeship 16-00 Sokol Ostroda — DKS Dobre Miasto 7+"  (2 точки)
+#   "Belarus. Second League 18-30 Turkspor Belarus — BFSO-Dynamo Minsk п2 5+"                (1 точка)
+# Правило (подтверждено пользователем): 1 или 2 точки в начале блока, не больше;
+# команды всегда разделены тире "—", но тире НЕ используется как обязательное условие
+# границы — если у одного блока тире вдруг нет, это не должно ломать поиск соседних блоков.
 # Слово с заглавной = кириллица/латиница/цифра в начале, дальше любые буквы/дефисы,
-# может состоять из нескольких слов через пробел (например "4 Liga", "La Liga").
+# может состоять из нескольких слов через пробел (например "4 Liga", "La Liga", "Second League").
 _WORD_GROUP = r'[A-ZА-Я0-9][\w\-]*(?:\s[A-ZА-Я0-9][\w\-]*)*'
+_NEW_FORMAT_HEADER = r'(?:' + _WORD_GROUP + r'\.\s*){1,2}'  # Страна. или Страна. Лига.
 _NEW_FORMAT_START = re.compile(
-    r'(?:^|(?<=\s))'                         # начало текста или после пробела — граница блока
-    r'(?=' + _WORD_GROUP + r'\.\s*'          # Страна.
-    + _WORD_GROUP + r'\.\s*'                 # Лига.  (обе точки обязательны)
-    r'[^.]*?\d{1,2}[-:]\d{2}\b)'             # ...любой текст без точек... время
+    r'(?:^|(?<=\s))'                    # начало текста или после пробела — граница блока
+    r'(?=' + _NEW_FORMAT_HEADER +       # Страна.[ Лига.]  (1-2 повтора)
+    r'[^.]*?\d{1,2}[-:]\d{2}\b)'        # ...любой текст без точек... время
 )
 
 
@@ -34,7 +39,7 @@ def parse_predictions(text: str, tz_offset: int = 3, source: str = "manual") -> 
 
     Новый формат:
     1. Длинные тире (3+ подряд) тоже разделяют блоки на разное время
-    2. Внутри блока новый прогноз начинается с "Страна. Лига." (ровно две точки)
+    2. Внутри блока новый прогноз начинается с "Страна." или "Страна. Лига." (1-2 точки)
     3. Время — как и в старом формате, HH-MM или HH:MM
     """
     normalized = text.replace('\r\n', '\n').replace('\r', '\n')
@@ -77,11 +82,32 @@ def _split_old_format(flat: str) -> list[str]:
 
 
 def _split_new_format(flat: str) -> list[str]:
-    """Новый формат: делит по вхождениям 'Страна. Лига.'."""
-    positions = [m.start() for m in _NEW_FORMAT_START.finditer(flat)]
+    """
+    Новый формат: делит по вхождениям 'Страна.[ Лига.]'.
+
+    Работает в два шага, чтобы не путать реальное начало блока со случайным
+    совпадением паттерна на промежуточном слове внутри уже начатого блока
+    (например "Liga" внутри "Peru. Liga Nacional. Women..."):
+    1. Находим ВСЕ позиции, где в принципе похоже на начало блока.
+    2. Оставляем только те, что не попадают "посреди" заголовка (Страна.[Лига.])
+       предыдущего уже принятого блока.
+    """
+    candidates = [m.start() for m in _NEW_FORMAT_START.finditer(flat)]
+    if not candidates:
+        return []
+
+    valid_starts = [candidates[0]]
+    for pos in candidates[1:]:
+        prev = valid_starts[-1]
+        header_m = re.match(_NEW_FORMAT_HEADER, flat[prev:])
+        header_end = prev + header_m.end() if header_m else prev
+        if pos >= header_end:
+            valid_starts.append(pos)
+        # иначе pos — ложный старт внутри заголовка предыдущего блока, пропускаем
+
     result = []
-    for i, pos in enumerate(positions):
-        end = positions[i + 1] if i + 1 < len(positions) else len(flat)
+    for i, pos in enumerate(valid_starts):
+        end = valid_starts[i + 1] if i + 1 < len(valid_starts) else len(flat)
         block = flat[pos:end].strip()
         if block:
             result.append(block)
