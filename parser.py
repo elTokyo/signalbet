@@ -3,42 +3,89 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 from models import Prediction
 
-# Триггеры начала нового прогноза
+# Триггеры начала нового прогноза (старый формат)
 TRIGGERS = ("футбол.", "soccer.", "футбол ", "soccer ")
+
+# Старый формат целиком начинается с "Футбол"/"Soccer" (без учёта регистра)
+_OLD_FORMAT_TRIGGER = re.compile(r'(?i)^\s*(?:футбол|soccer)[\.\s]')
+
+# Новый формат: "Страна. Лига. <любой текст без точек> HH-MM/HH:MM ..."
+# Пример: "Poland. 4 Liga. Warmia-Masuria Voivodeship 16-00 Sokol Ostroda — DKS Dobre Miasto 7+"
+# Слово с заглавной = кириллица/латиница/цифра в начале, дальше любые буквы/дефисы,
+# может состоять из нескольких слов через пробел (например "4 Liga", "La Liga").
+_WORD_GROUP = r'[A-ZА-Я0-9][\w\-]*(?:\s[A-ZА-Я0-9][\w\-]*)*'
+_NEW_FORMAT_START = re.compile(
+    r'(?:^|(?<=\s))'                         # начало текста или после пробела — граница блока
+    r'(?=' + _WORD_GROUP + r'\.\s*'          # Страна.
+    + _WORD_GROUP + r'\.\s*'                 # Лига.  (обе точки обязательны)
+    r'[^.]*?\d{1,2}[-:]\d{2}\b)'             # ...любой текст без точек... время
+)
 
 
 def parse_predictions(text: str, tz_offset: int = 3, source: str = "manual") -> list[Prediction]:
     """
-    Парсер прогнозов:
+    Парсер прогнозов. Поддерживает два формата сообщений (не смешиваются в одном
+    сообщении — формат определяется по всему тексту целиком):
+
+    Старый формат:
     1. Длинные тире (3+ подряд) разделяют блоки прогнозов на разное время
     2. Внутри блока новый прогноз начинается со слов "Футбол" или "Soccer"
     3. Каждый прогноз содержит время в формате HH-MM или HH:MM
+
+    Новый формат:
+    1. Длинные тире (3+ подряд) тоже разделяют блоки на разное время
+    2. Внутри блока новый прогноз начинается с "Страна. Лига." (ровно две точки)
+    3. Время — как и в старом формате, HH-MM или HH:MM
     """
     normalized = text.replace('\r\n', '\n').replace('\r', '\n')
 
-    # Заменяем разделитель из тире на одинаковый маркер
+    # Заменяем разделитель из тире на одинаковый маркер (общее для обоих форматов)
     normalized = re.sub(r'[-–—]{3,}', '\n', normalized)
 
     # Склеиваем всё в одну строку через пробел, чтобы было удобно искать триггеры
     flat = re.sub(r'\s+', ' ', normalized).strip()
 
-    # Разбиваем по триггерам, сохраняя их в начале каждого фрагмента
-    # Паттерн ищет "Футбол." или "Soccer." как начало (case-insensitive)
-    parts = re.split(r'(?i)(?=(?:футбол|soccer)[\.\s])', flat)
+    if not flat:
+        return []
+
+    if _OLD_FORMAT_TRIGGER.match(flat):
+        parts = _split_old_format(flat)
+    else:
+        parts = _split_new_format(flat)
 
     predictions = []
     for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-        # Должен начинаться с триггера
-        if not part.lower().startswith(("футбол", "soccer")):
-            continue
         pred = _parse_one(part, tz_offset, source)
         if pred:
             predictions.append(pred)
 
     return predictions
+
+
+def _split_old_format(flat: str) -> list[str]:
+    """Старый формат: делит по вхождениям 'Футбол'/'Soccer'."""
+    parts = re.split(r'(?i)(?=(?:футбол|soccer)[\.\s])', flat)
+    result = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if not part.lower().startswith(("футбол", "soccer")):
+            continue
+        result.append(part)
+    return result
+
+
+def _split_new_format(flat: str) -> list[str]:
+    """Новый формат: делит по вхождениям 'Страна. Лига.'."""
+    positions = [m.start() for m in _NEW_FORMAT_START.finditer(flat)]
+    result = []
+    for i, pos in enumerate(positions):
+        end = positions[i + 1] if i + 1 < len(positions) else len(flat)
+        block = flat[pos:end].strip()
+        if block:
+            result.append(block)
+    return result
 
 
 def _parse_one(text: str, tz_offset: int, source: str) -> Optional[Prediction]:
