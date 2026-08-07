@@ -92,6 +92,59 @@ def test_parser():
     preds = parser.parse_predictions("Soccer. 14:30 A — B п1 4+", 3, "manual")
     check("Время в формате HH:MM", len(preds) == 1)
 
+    # ── Регрессия: склейка прогнозов с составным заголовком "Страна. Лига - Подлига" ──
+    # Баг: заголовок с доп. сегментом через дефис ("Australia. State League 2 - West
+    # Australian") распознавался только частично (до первой точки), из-за чего конец
+    # заголовка одного прогноза приклеивался к началу следующего, а если в доп. сегменте
+    # была своя точка ("...- West Australian. Women"), парсер резал заголовок пополам.
+
+    # Два прогноза, заголовок каждого — "Страна. Лига - Подлига[.]" (точный формат из Discord)
+    text = (
+        "Australia. State League 2 - West Australian 14-30\n"
+        "Kalamunda City — Gosnells City\n"
+        "п1 4+\n"
+        "\n"
+        "Australia. State League 1 - West Australian. Women\n"
+        "14-30\n"
+        "Perth AFC W — Mandurah City W\n"
+        "п2 4+"
+    )
+    preds = parser.parse_predictions(text, 3, "manual")
+    check("Составной заголовок 'Страна.Лига-Подлига' → 2 прогноза (не склеены)", len(preds) == 2)
+    if len(preds) == 2:
+        check(
+            "  Блок 1 не содержит хвост заголовка второго прогноза",
+            "Australia. State League 1" not in preds[0].text,
+        )
+        check(
+            "  Блок 2 не потерял начало своего заголовка",
+            preds[1].text.startswith("Australia. State League 1 - West Australian. Women"),
+        )
+        check("  Блок 1 содержит свои команды", "Kalamunda City" in preds[0].text)
+        check("  Блок 2 содержит свои команды", "Perth AFC W" in preds[1].text)
+
+    # Реальные примеры из жалобы пользователя (заголовок без доп. сегмента через дефис,
+    # но с пустой строкой между блоками, которая схлопывается при нормализации пробелов)
+    text2 = (
+        "South Australian. Women 14-00 Modbury Jets W — Cove W п1 4+\n"
+        "\n"
+        "South Australian. Women 13-45 Adelaide Jaguars W — Elizabeth Grove W п1 3+"
+    )
+    preds2 = parser.parse_predictions(text2, 3, "manual")
+    check("Два 'South Australian' прогноза подряд → не склеены", len(preds2) == 2)
+    if len(preds2) == 2:
+        check("  Первый — Modbury/Cove", "Modbury Jets W" in preds2[0].text and "Cove W" in preds2[0].text)
+        check("  Второй — Adelaide/Elizabeth Grove", "Adelaide Jaguars W" in preds2[1].text)
+
+    # Три блока подряд со смешанными вариантами заголовка (1 точка / 2 точки / точка+дефис+точка)
+    text3 = (
+        "Kuwait. Premier League 18-15 Al Arabi — Al Tadamon п1 100+\n"
+        "South Australian. Women 14-00 Modbury Jets W — Cove W п1 4+\n"
+        "Australia. State League 1 - West Australian. Women 14-30 Perth AFC W — Mandurah City W п2 4+"
+    )
+    preds3 = parser.parse_predictions(text3, 3, "manual")
+    check("Три разных заголовка подряд → 3 прогноза", len(preds3) == 3)
+
 
 # ── Тесты извлечения команд ──────────────────────────────────────────────────
 
