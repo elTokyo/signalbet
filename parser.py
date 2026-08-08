@@ -28,11 +28,6 @@ _OLD_FORMAT_TRIGGER = re.compile(r'(?i)^\s*(?:футбол|soccer)[\.\s]')
 _WORD_GROUP = r'[A-ZА-Я0-9][\w\-]*(?:\s[A-ZА-Я0-9][\w\-]*)*'
 _HEADER_SEGMENT_SEP = r'(?:\.\s+|\s-\s)'   # конец сегмента: ". " или " - "
 _NEW_FORMAT_HEADER = r'(?:' + _WORD_GROUP + _HEADER_SEGMENT_SEP + r'){1,3}'  # Страна.[ Лига.][ - Подлига.]
-_NEW_FORMAT_START = re.compile(
-    r'(?:^|(?<=\s))'                    # начало текста или после пробела — граница блока
-    r'(?=' + _NEW_FORMAT_HEADER +       # Страна.[ Лига.][ - Подлига.]  (1-3 сегмента)
-    r'[^.]*?\d{1,2}[-:]\d{2}\b)'        # ...любой текст без точек... время
-)
 
 
 def parse_predictions(text: str, tz_offset: int = 3, source: str = "manual") -> list[Prediction]:
@@ -49,22 +44,36 @@ def parse_predictions(text: str, tz_offset: int = 3, source: str = "manual") -> 
     1. Длинные тире (3+ подряд) тоже разделяют блоки на разное время
     2. Внутри блока новый прогноз начинается с "Страна." или "Страна. Лига." (1-2 точки)
     3. Время — как и в старом формате, HH-MM или HH:MM
+
+    ВАЖНО про переносы строк: реальные сообщения из Discord построчные —
+    лига/время, потом команды, потом (опционально) ставка — БЕЗ пустой строки
+    перед следующим прогнозом. Поэтому перенос строки — единственный надёжный
+    сигнал границы между прогнозами, и мы его не теряем: разбиваем по строкам
+    и ищем начало нового блока только в начале строки (см. _split_old_format /
+    _split_new_format). Раньше весь текст сразу схлопывался в одну строку через
+    пробел, из-за чего название второй команды (например "Kazincbarcikai SC" —
+    с заглавных букв, как и заголовок) можно было спутать с началом следующего
+    блока, и парсер обрезал прогноз посередине, склеивая хвост со следующим.
     """
     normalized = text.replace('\r\n', '\n').replace('\r', '\n')
 
     # Заменяем разделитель из тире на одинаковый маркер (общее для обоих форматов)
     normalized = re.sub(r'[-–—]{3,}', '\n', normalized)
 
-    # Склеиваем всё в одну строку через пробел, чтобы было удобно искать триггеры
-    flat = re.sub(r'\s+', ' ', normalized).strip()
-
-    if not flat:
+    if not normalized.strip():
         return []
 
-    if _OLD_FORMAT_TRIGGER.match(flat):
-        parts = _split_old_format(flat)
+    # Для определения формата (старый/новый) достаточно взглянуть на текст в целом
+    flat_probe = re.sub(r'\s+', ' ', normalized).strip()
+    is_old_format = bool(_OLD_FORMAT_TRIGGER.match(flat_probe))
+
+    lines = [ln.strip() for ln in normalized.split('\n')]
+    lines = [ln for ln in lines if ln]  # убираем пустые строки
+
+    if is_old_format:
+        parts = _split_old_format(lines)
     else:
-        parts = _split_new_format(flat)
+        parts = _split_new_format(lines)
 
     predictions = []
     for part in parts:
@@ -75,51 +84,150 @@ def parse_predictions(text: str, tz_offset: int = 3, source: str = "manual") -> 
     return predictions
 
 
-def _split_old_format(flat: str) -> list[str]:
-    """Старый формат: делит по вхождениям 'Футбол'/'Soccer'."""
-    parts = re.split(r'(?i)(?=(?:футбол|soccer)[\.\s])', flat)
-    result = []
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-        if not part.lower().startswith(("футбол", "soccer")):
-            continue
-        result.append(part)
-    return result
+_OLD_FORMAT_LINE_START = re.compile(r'(?i)^(?:футбол|soccer)[\.\s]')
+
+# Заголовок нового прогноза должен начинаться В НАЧАЛЕ СТРОКИ — это то, что
+# в реальных Discord-сообщениях отличает "Jordan. First Division. Women" (новая
+# строка, новый прогноз) от "Kazincbarcikai SC" (конец строки с командами
+# предыдущего прогноза, тоже с заглавных букв, но НЕ в начале своей строки).
+_NEW_FORMAT_LINE_START = re.compile(r'^' + _NEW_FORMAT_HEADER)
 
 
-def _split_new_format(flat: str) -> list[str]:
+_OLD_FORMAT_INLINE_TRIGGER = re.compile(r'(?i)(?<=\s)(?:футбол|soccer)[\.\s]')
+
+
+def _split_old_format(lines: list[str]) -> list[str]:
     """
-    Новый формат: делит по вхождениям 'Страна.[ Лига.]'.
-
-    Работает в два шага, чтобы не путать реальное начало блока со случайным
-    совпадением паттерна на промежуточном слове внутри уже начатого блока
-    (например "Liga" внутри "Peru. Liga Nacional. Women..."):
-    1. Находим ВСЕ позиции, где в принципе похоже на начало блока.
-    2. Оставляем только те, что не попадают "посреди" заголовка (Страна.[Лига.])
-       предыдущего уже принятого блока.
+    Старый формат: новый прогноз начинается с 'Футбол'/'Soccer'. Триггер —
+    фиксированное слово (не открытая грамматика заголовка, как в новом
+    формате), поэтому в отличие от _split_new_format искать его безопасно
+    в любом месте строки, не только в начале — команда с названием
+    "Футбол ..." практически невозможна, ложных срабатываний на названиях
+    команд не бывает. Это восстанавливает старое поведение (весь текст
+    целиком) для сообщений, слитых в одну строку без переносов, и
+    одновременно уважает построчную структуру там, где она есть.
     """
-    candidates = [m.start() for m in _NEW_FORMAT_START.finditer(flat)]
-    if not candidates:
-        return []
+    blocks = []
+    current = []
+    for raw_line in lines:
+        line = re.sub(r'[ \t]+', ' ', raw_line).strip()
+        if not line:
+            continue
 
-    valid_starts = [candidates[0]]
-    for pos in candidates[1:]:
-        prev = valid_starts[-1]
-        header_m = re.match(_NEW_FORMAT_HEADER, flat[prev:])
-        header_end = prev + header_m.end() if header_m else prev
-        if pos >= header_end:
-            valid_starts.append(pos)
-        # иначе pos — ложный старт внутри заголовка предыдущего блока, пропускаем
+        # Строка может содержать несколько триггеров подряд (сообщение
+        # слито в одну строку) — режем по каждому вхождению.
+        cut_points = [m.start() for m in _OLD_FORMAT_INLINE_TRIGGER.finditer(line)]
+        chunks = []
+        prev = 0
+        for pos in cut_points:
+            chunks.append(line[prev:pos].strip())
+            prev = pos
+        chunks.append(line[prev:].strip())
+        chunks = [c for c in chunks if c]
 
-    result = []
-    for i, pos in enumerate(valid_starts):
-        end = valid_starts[i + 1] if i + 1 < len(valid_starts) else len(flat)
-        block = flat[pos:end].strip()
-        if block:
-            result.append(block)
-    return result
+        for chunk in chunks:
+            if _OLD_FORMAT_LINE_START.match(chunk):
+                if current:
+                    blocks.append(' '.join(current))
+                current = [chunk]
+            elif current:
+                current.append(chunk)
+            # чанки до первого валидного заголовка отбрасываются
+    if current:
+        blocks.append(' '.join(current))
+    return blocks
+
+
+def _split_new_format(lines: list[str]) -> list[str]:
+    """
+    Новый формат: новый прогноз начинается с 'Страна.[ Лига.]... HH-MM ...'.
+
+    Заголовок ищем ДВУМЯ способами одновременно, потому что реальные
+    Discord-сообщения бывают и построчными (лига/время, команды, ставка —
+    каждое на своей строке), и слитыми в один абзац (весь прогноз одной
+    строкой, несколько прогнозов подряд без переносов вовсе):
+    1. В начале очередной строки (естественная граница построчного формата).
+    2. В любом месте ВНУТРИ строки — но только если накопленный текущий
+       блок уже "закрыт" (см. _block_is_closed): у него уже есть и время,
+       и обе команды. Это тот же сигнал, что раньше использовался для
+       всего текста целиком, но здесь применяется точечно — только когда
+       переноса строки не случилось, а не как основной механизм. Именно
+       "закрытость" (не просто заглавная буква) отличает реальный новый
+       заголовок от названия команды предыдущего прогноза ("Kazincbarcikai
+       SC") — та тоже с заглавной, но стоит ДО тире, а не после него.
+    """
+    blocks = []
+    current = []
+    for raw_line in lines:
+        # Схлопываем внутристрочные пробелы/табы (в Discord между лигой и
+        # временем часто стоит несколько пробелов/таб — раньше это убирал
+        # общий re.sub на всём тексте, теперь делаем это здесь, построчно).
+        line = re.sub(r'[ \t]+', ' ', raw_line).strip()
+        if not line:
+            continue
+
+        for chunk in _split_line_on_closed_headers(line):
+            is_header_chunk = bool(_NEW_FORMAT_LINE_START.match(chunk))
+
+            if is_header_chunk and _block_is_closed(current):
+                if current:
+                    blocks.append(' '.join(current))
+                current = [chunk]
+            elif current:
+                current.append(chunk)
+            elif is_header_chunk:
+                # первая строка блока, даже если время придёт отдельной строкой позже
+                current = [chunk]
+            # чанки до первого валидного заголовка отбрасываются
+    if current:
+        blocks.append(' '.join(current))
+    return blocks
+
+
+def _split_line_on_closed_headers(line: str) -> list[str]:
+    """
+    Разбивает ОДНУ строку на куски там, где внутри неё встречается новый
+    заголовок после уже "закрытого" (время + обе команды) фрагмента.
+    Нужно для редкого случая, когда несколько прогнозов слиты в одну строку
+    без переноса вообще (например текст вставлен без сохранения форматирования).
+    Для обычных построчных сообщений просто вернёт [line] без изменений —
+    внутри одной строки Discord-сообщения второй заголовок не встречается.
+    """
+    matches = list(re.finditer(r'(?<=\s)' + _NEW_FORMAT_HEADER, line))
+    if not matches:
+        return [line]
+
+    cut_points = []
+    for m in matches:
+        prefix = line[:m.start()]
+        if _block_is_closed([prefix]):
+            cut_points.append(m.start())
+
+    if not cut_points:
+        return [line]
+
+    chunks = []
+    prev = 0
+    for pos in cut_points:
+        chunks.append(line[prev:pos].strip())
+        prev = pos
+    chunks.append(line[prev:].strip())
+    return [c for c in chunks if c]
+
+
+def _block_is_closed(current: list[str]) -> bool:
+    """
+    True если накопленный текст уже содержит и время, и обе команды —
+    то есть прогноз уже "полный", и следующий встреченный заголовок точно
+    относится к НОВОМУ прогнозу, а не является названием команды/лиги
+    текущего (например "Kazincbarcikai SC" перед "Jordan. First Division").
+    """
+    if not current:
+        return True
+    joined = ' '.join(current)
+    has_time = bool(re.search(r'\d{1,2}[-:]\d{2}\b', joined))
+    has_teams = bool(re.search(r'\s[—–]\s', joined))
+    return has_time and has_teams
 
 
 def _parse_one(text: str, tz_offset: int, source: str) -> Optional[Prediction]:

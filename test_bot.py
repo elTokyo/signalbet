@@ -145,6 +145,72 @@ def test_parser():
     preds3 = parser.parse_predictions(text3, 3, "manual")
     check("Три разных заголовка подряд → 3 прогноза", len(preds3) == 3)
 
+    # ── Регрессия: вторая команда с заглавными буквами ("...SC", "...FC") ──
+    # Баг из реального Discord-канала: команда 2 предыдущего прогноза (например
+    # "Kazincbarcikai SC") сама по себе похожа на начало заголовка (заглавные
+    # буквы), и старый алгоритм (искал позицию по всему схлопнутому тексту)
+    # обрезал прогноз ровно после тире, теряя команду 2 и ставку, а хвост
+    # приклеивал к следующему прогнозу. Реальный кейс: 5+ прогнозов подряд без
+    # пустых строк между блоками, время у нескольких совпадает (18-00).
+    text4 = (
+        "Hungary. Second Division    18-00\n"
+        "Gyirmot — Kazincbarcikai SC\n"
+        "Jordan. First Division. Women    18-00\n"
+        "Al Raya W — Doqarah W\n"
+        "Moldova. Division A    18-00\n"
+        "Falesti — Victoria Bardar\n"
+        "Moldova. Division A    18-00\n"
+        "Stauceni — Floresti\n"
+        "Poland. 4 Liga. Podlaskie Voivodeship    18-00\n"
+        "KS Wasilkow — LZS Krynki\n"
+        "----------------\n"
+        "Belarus. Second League    18-30\n"
+        "Spartak Minsk — Urozhaynaya\n"
+        "Hungary. Second Division    18-30\n"
+        "BVSC-Zuglo — Kecskemeti\n"
+        "Hungary. Third Division. Northeast    18-30\n"
+        "Salgotarjani BTC — Mateszalkai MTK"
+    )
+    preds4 = parser.parse_predictions(text4, 3, "manual")
+    check("5 прогнозов на 18-00 без пустых строк → не склеены", len(preds4) == 8)
+    if len(preds4) == 8:
+        check("  П1: Gyirmot — Kazincbarcikai SC целиком",
+              "Gyirmot" in preds4[0].text and "Kazincbarcikai SC" in preds4[0].text)
+        check("  П2 не потерял заголовок 'Jordan.'",
+              preds4[1].text.startswith("Jordan. First Division. Women"))
+        check("  П2: Al Raya W — Doqarah W целиком",
+              "Al Raya W" in preds4[1].text and "Doqarah W" in preds4[1].text)
+        check("  П3/П4 (два 'Moldova. Division A' подряд) не склеены",
+              "Falesti" in preds4[2].text and "Falesti" not in preds4[3].text)
+        check("  П8 (после блочного разделителя) сохранил заголовок",
+              preds4[7].text.startswith("Hungary. Third Division. Northeast"))
+
+    # Тот же баг, но прогноз из жалобы пользователя (с реальной ставкой "7+"/"5+"
+    # на отдельной строке после команд, и скобки в названиях команд/лиг)
+    text5 = (
+        "Poland. Women Ekstraklasa    13-00\n"
+        "AAPLG Gdansk W — ZS UJ Krakow W\n"
+        "7+\n"
+        "Finland. Kolmonen. Etela-Suomi    13-00\n"
+        "Toukolan Teras — PPJ/Lauttasaari\n"
+        "7+\n"
+        "India. Durand Cup. Group stage    13-30\n"
+        "Shillong Lajong — Mumbay FC\n"
+        "см стату\n"
+        "Australia. Premier League - Northern Territory (reserves)    13-30\n"
+        "University Azzurri (res) — Hellenic AC (res)\n"
+        "п1 5+"
+    )
+    preds5 = parser.parse_predictions(text5, 3, "manual")
+    check("4 прогноза со ставкой на отдельной строке → не склеены", len(preds5) == 4)
+    if len(preds5) == 4:
+        check("  П1 содержит свою ставку '7+', не ставку П2",
+              preds5[0].text.rstrip().endswith("7+") and "Finland" not in preds5[0].text)
+        check("  П3 (без явной ставки, 'см стату') не проглотил П4",
+              "см стату" in preds5[2].text and "Australia" not in preds5[2].text)
+        check("  П4 сохранил составной заголовок с скобками",
+              preds5[3].text.startswith("Australia. Premier League - Northern Territory (reserves)"))
+
 
 # ── Тесты извлечения команд ──────────────────────────────────────────────────
 
