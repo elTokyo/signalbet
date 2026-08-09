@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 RECHECK_INTERVAL_SEC = 15 * 60   # перечит раз в 15 минут
 RECHECK_HISTORY_LIMIT = 50       # читаем больше сообщений чтобы охватить все прогнозы дня
 
+# Выше этого числа прогнозов в одном синке шлём короткую сводку по лигам
+# вместо полного построчного списка — полный список всегда есть в /list.
+_SUMMARY_THRESHOLD = 15
+_TG_MESSAGE_LIMIT = 3900
+
 # Ссылки на работающий Discord-клиент и его event loop —
 # нужны чтобы вызвать перечит из другого потока (Telegram-команда /syncdiscord)
 _client_ref: discord.Client | None = None
@@ -113,7 +118,25 @@ async def _manual_recheck(label: str = "автопроверка") -> dict:
 
 
 async def _notify_added(preds: list, label: str):
-    """Шлёт уведомление о добавленных прогнозах с пометкой источника (в скобках)."""
+    """
+    Шлёт уведомление о добавленных прогнозах с пометкой источника (в скобках).
+
+    Прогнозы группируются по времени матча (одна временная метка — одна строка
+    с эмодзи, дальше список матчей на это время без повтора времени в каждой
+    строке) — раньше время дублировалось в каждой строке (⏰ {t} {p.text}, а
+    p.text уже сам по себе начинается с "Лига ... HH-MM ..."), что при большом
+    числе прогнозов (например после миграции/переезда на новый парсер, когда
+    Discord присылает разом весь актуальный список) превращало сообщение в
+    нечитаемую простыню.
+
+    При очень большом числе прогнозов (> _SUMMARY_THRESHOLD) шлём короткую
+    сводку с разбивкой по лигам вместо полного списка — полный список всегда
+    доступен через /list.
+
+    Сообщение разбивается на чанки по лимиту Telegram (см. _chunk_lines) —
+    раньше это не делалось, и большая пачка прогнозов рисковала быть обрезана
+    или не отправлена вовсе (Telegram отклоняет сообщения длиннее ~4096 символов).
+    """
     if not preds:
         return
     all_recipients = storage.get_all_recipient_chat_ids()
@@ -128,19 +151,98 @@ async def _notify_added(preds: list, label: str):
         async with aiohttp.ClientSession() as session:
             for chat_id in recipients:
                 s = storage.load_settings(chat_id)
-                lines = [f"🤖 Из Discord: +{len(preds)} прогнозов ({label})"]
-                for p in preds:
-                    t = format_time_local(p, s.timezone_offset)
-                    lines.append(f"⏰ {t}  {p.text}")
-                try:
-                    await session.post(
-                        f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendMessage",
-                        json={"chat_id": chat_id, "text": "\n".join(lines)},
-                    )
-                except Exception as e:
-                    logger.error(f"TG send to {chat_id} failed: {e}")
+                messages = _build_notify_messages(preds, s.timezone_offset, label)
+                for text in messages:
+                    try:
+                        await session.post(
+                            f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendMessage",
+                            json={"chat_id": chat_id, "text": text},
+                        )
+                    except Exception as e:
+                        logger.error(f"TG send to {chat_id} failed: {e}")
     except Exception as e:
         logger.error(f"Discord broadcast error: {e}")
+
+
+def _pluralize_predictions(n: int) -> str:
+    """Русское склонение 'прогноз/прогноза/прогнозов' по числу n."""
+    n_abs = abs(n) % 100
+    last = n_abs % 10
+    if 11 <= n_abs <= 14:
+        return "прогнозов"
+    if last == 1:
+        return "прогноз"
+    if 2 <= last <= 4:
+        return "прогноза"
+    return "прогнозов"
+
+
+def _build_notify_messages(preds: list, tz_offset: int, label: str) -> list[str]:
+    """Строит одно или несколько готовых к отправке сообщений Telegram."""
+    header = f"🤖 Из Discord: +{len(preds)} {_pluralize_predictions(len(preds))} ({label})"
+
+    if len(preds) > _SUMMARY_THRESHOLD:
+        return _chunk_lines([header, ""] + _summary_lines(preds), _TG_MESSAGE_LIMIT)
+
+    lines = [header, ""]
+    for time_label, group in _group_by_time(preds, tz_offset):
+        lines.append(f"⏰ {time_label}")
+        for p in group:
+            lines.append(f"   {p.text}")
+        lines.append("")
+
+    return _chunk_lines(lines, _TG_MESSAGE_LIMIT)
+
+
+def _group_by_time(preds: list, tz_offset: int) -> list[tuple[str, list]]:
+    """Группирует прогнозы по локальному времени матча, сохраняя порядок."""
+    groups: dict[str, list] = {}
+    order: list[str] = []
+    for p in preds:
+        t = format_time_local(p, tz_offset)
+        if t not in groups:
+            groups[t] = []
+            order.append(t)
+        groups[t].append(p)
+    return [(t, groups[t]) for t in order]
+
+
+def _summary_lines(preds: list) -> list[str]:
+    """
+    Короткая сводка вместо полного списка: количество прогнозов по лиге.
+    Лигу берём как текст до первого времени в p.text (то же самое, что
+    видит пользователь в начале каждой строки прогноза).
+    """
+    import re
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    for p in preds:
+        m = re.match(r'^(.*?)\s*\d{1,2}[-:]\d{2}\b', p.text)
+        league = m.group(1).strip() if m else p.text[:40].strip()
+        if league not in counts:
+            counts[league] = 0
+            order.append(league)
+        counts[league] += 1
+    lines = [f"• {league} — {counts[league]}" for league in order]
+    lines.append("")
+    lines.append("Полный список: /list")
+    return lines
+
+
+def _chunk_lines(lines: list[str], limit: int) -> list[str]:
+    """Склеивает строки в сообщения, не превышая limit символов каждое."""
+    messages = []
+    buffer = ""
+    for line in lines:
+        candidate = f"{buffer}\n{line}" if buffer else line
+        if len(candidate) > limit and buffer:
+            messages.append(buffer)
+            buffer = line
+        else:
+            buffer = candidate
+    if buffer.strip():
+        messages.append(buffer)
+    return messages
 
 
 async def _process_static(content: str, origin: str, label: str = "новое сообщение"):
