@@ -47,6 +47,7 @@ def _load(name):
 models = _load('models')
 parser = _load('parser')
 fonbet = _load('fonbet')
+discord_listener = _load('discord_listener')
 
 # Счётчики
 _passed = 0
@@ -211,6 +212,39 @@ def test_parser():
         check("  П4 сохранил составной заголовок с скобками",
               preds5[3].text.startswith("Australia. Premier League - Northern Territory (reserves)"))
 
+    # ── Регрессия: скобки ВНУТРИ заголовка (не только в конце строки) ──
+    # Баг из реального Discord-канала: "Myanmar (Burma). Youth League U20" не
+    # распознавался как заголовок вообще, потому что скобка сразу после первого
+    # слова обрывала _WORD_GROUP до появления разделителя сегмента (". "/" - ").
+    # Вся строка считалась продолжением предыдущего блока (Belarus), и два
+    # разных прогноза на разные матчи склеивались в один. Отличается от
+    # предыдущего кейса (preds5, П4) тем, что там скобки стоят В КОНЦЕ, уже
+    # после времени — там заголовок успевает "закрыться" до скобок.
+    text6 = (
+        "Australia. League 1 - New South Wales. Women    12-00\n"
+        "Blacktown Spartans W — Sutherland Strikers W\n"
+        "7+\n"
+        "Belarus. Second League    12-00\n"
+        "Nadezhda Gorodishche — Krechet\n"
+        "п1 5+\n"
+        "Myanmar (Burma). Youth League U20    12-00\n"
+        "Falcon Myanmar U20 — Ayeyawady United U20\n"
+        "п1 5+\n"
+        "Slovenia. Top League. Women    12-00\n"
+        "Cerklje W — ZNK Ljubljana W\n"
+        "ф2-3,5"
+    )
+    preds6 = parser.parse_predictions(text6, 3, "manual")
+    check("Скобки в середине заголовка ('Myanmar (Burma).') → заголовок не потерян",
+          len(preds6) == 4)
+    if len(preds6) == 4:
+        check("  П2 (Belarus) не проглотил П3 (Myanmar)",
+              "Krechet" in preds6[1].text and "Myanmar" not in preds6[1].text)
+        check("  П3 сохранил заголовок 'Myanmar (Burma).'",
+              preds6[2].text.startswith("Myanmar (Burma). Youth League U20"))
+        check("  П4 (Slovenia) не склеен с П3",
+              preds6[3].text.startswith("Slovenia. Top League. Women"))
+
 
 # ── Тесты извлечения команд ──────────────────────────────────────────────────
 
@@ -330,6 +364,57 @@ def test_age_markers():
           fonbet._age_markers_compatible("Atletico — Fast", "Atletico U20", "Fast U20") is False)
 
 
+def test_notify_grouping():
+    print("\n[Группировка/сортировка уведомлений Discord]")
+
+    from models import Prediction
+    # match_time в БД хранится в UTC (naive datetime, как datetime.utcnow()
+    # в storage.py); format_time_local сама прибавляет tz_offset при выводе.
+    # Здесь offset=3, поэтому base-час UTC выбираем так, чтобы после +3
+    # получались "круглые" значения, удобные для проверки.
+    base = datetime(2026, 8, 9, 0, 0)
+
+    def mk(text, hh_local, mm):
+        # hh_local — то время, которое должно получиться ПОСЛЕ +3 (offset=3)
+        return Prediction(text=text, match_time=base.replace(hour=(hh_local - 3) % 24, minute=mm), source="discord")
+
+    # Регрессия: реальный кейс пользователя — added_preds приходит в порядке
+    # чтения истории Discord (новые сообщения первыми), НЕ в порядке времени
+    # матчей. Раньше _group_by_time сохраняла этот порядок как есть, и
+    # уведомление шло 11:30 → 12:00 → 12:40 → 13:00 → 14:00 → 10:30 (последний
+    # блок из более старого/раннего сообщения оказывался в конце).
+    preds = [
+        mk("A", 11, 30),
+        mk("B", 12, 0),
+        mk("C", 12, 40),
+        mk("D", 13, 0),
+        mk("E", 14, 0),
+        mk("F", 10, 30),   # физически раньше всех, но последний в списке
+        mk("G", 10, 30),
+    ]
+    groups = discord_listener._group_by_time(preds, tz_offset=3)
+    labels = [t for t, _ in groups]
+    check("Группы отсортированы по времени, а не по порядку появления",
+          labels == ["10:30", "11:30", "12:00", "12:40", "13:00", "14:00"])
+    check("Прогнозы на одно и то же время (10:30) остались в одной группе",
+          len(dict(groups)["10:30"]) == 2)
+
+    # Склонение — используется прямо в заголовке уведомления, ошибка тут
+    # означает неправильный текст на проде при каждом синке.
+    cases = {1: "прогноз", 2: "прогноза", 4: "прогноза", 5: "прогнозов",
+             11: "прогнозов", 12: "прогнозов", 14: "прогнозов",
+             21: "прогноз", 22: "прогноза", 25: "прогнозов"}
+    all_ok = all(discord_listener._pluralize_predictions(n) == word
+                 for n, word in cases.items())
+    check("Склонение 'прогноз/прогноза/прогнозов' верно для всех проверенных чисел", all_ok)
+
+    # Сводка вместо полного списка при большом числе прогнозов (порог = 15)
+    many = [mk(f"League {i}. Div    12-0{i%10}\nTeam A{i} — Team B{i}\n5+", 12, i % 60) for i in range(20)]
+    msg = discord_listener._build_notify_messages(many, 3, "автопроверка")
+    check("При >15 прогнозов уходит сводка, упоминающая /list",
+          any("/list" in m for m in msg))
+
+
 if __name__ == "__main__":
     print("=" * 50)
     print("ТЕСТЫ BET BOT")
@@ -342,6 +427,7 @@ if __name__ == "__main__":
     test_url()
     test_has_odds()
     test_age_markers()
+    test_notify_grouping()
 
     print("\n" + "=" * 50)
     print(f"Пройдено: {_passed}  |  Провалено: {_failed}")

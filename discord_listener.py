@@ -17,7 +17,7 @@ import aiohttp
 
 import storage
 import config
-from parser import parse_predictions, format_time_local
+from parser import parse_predictions, format_time_local, display_text_without_time
 
 logger = logging.getLogger(__name__)
 
@@ -188,23 +188,27 @@ def _build_notify_messages(preds: list, tz_offset: int, label: str) -> list[str]
     for time_label, group in _group_by_time(preds, tz_offset):
         lines.append(f"⏰ {time_label}")
         for p in group:
-            lines.append(f"   {p.text}")
+            lines.append(f"   {display_text_without_time(p, tz_offset)}")
         lines.append("")
 
     return _chunk_lines(lines, _TG_MESSAGE_LIMIT)
 
 
 def _group_by_time(preds: list, tz_offset: int) -> list[tuple[str, list]]:
-    """Группирует прогнозы по локальному времени матча, сохраняя порядок."""
+    """
+    Группирует прогнозы по локальному времени матча, сортируя группы по
+    фактическому match_time (а не по порядку появления в preds — тот
+    определяется порядком чтения истории Discord, не временем матчей,
+    из-за чего группы шли вперемешку: 11:30, 12:00, ..., 14:00, 10:30).
+    Сортировка по datetime, а не по строке времени, корректно обрабатывает
+    переход через полночь (нельзя просто сравнить "09:00" < "23:30" как строки).
+    """
     groups: dict[str, list] = {}
-    order: list[str] = []
     for p in preds:
         t = format_time_local(p, tz_offset)
-        if t not in groups:
-            groups[t] = []
-            order.append(t)
-        groups[t].append(p)
-    return [(t, groups[t]) for t in order]
+        groups.setdefault(t, []).append(p)
+    ordered_labels = sorted(groups, key=lambda t: min(p.match_time for p in groups[t]))
+    return [(t, groups[t]) for t in ordered_labels]
 
 
 def _summary_lines(preds: list) -> list[str]:

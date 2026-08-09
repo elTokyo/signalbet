@@ -6,7 +6,7 @@ from telegram.ext import ContextTypes
 import storage
 import auth
 import config
-from parser import parse_predictions, format_time_local
+from parser import parse_predictions, format_time_local, display_text_without_time
 
 logger = logging.getLogger(__name__)
 
@@ -124,12 +124,13 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = [f"📋 Активных прогнозов: {len(preds)}\n"]
     for i, p in enumerate(preds, 1):
         t = format_time_local(p, s.timezone_offset)
+        display_text = display_text_without_time(p, s.timezone_offset)
         status = " 🔔" if p.notified_30 else ""
         status = " ✅" if p.notified_5 else status
         src = " 🤖" if p.source == "discord" else ""
         # Админам показываем ID для удаления (без Markdown — скобки в названиях ломают разметку)
         id_line = f"\n   🆔 {p.id}" if is_adm else ""
-        lines.append(f"{i}. ⏰ {t}{status}{src}\n   {p.text}{id_line}")
+        lines.append(f"{i}. ⏰ {t}{status}{src}\n   {display_text}{id_line}")
 
     if is_adm:
         lines.append("\nДля удаления: /delete <id>")
@@ -773,7 +774,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines = [f"✅ Добавлено: {added}" + (f"  (дублей: {skipped})" if skipped else "")]
         for i, p in enumerate(preds, 1):
             t = format_time_local(p, s.timezone_offset)
-            lines.append(f"\n{i}. ⏰ {t}\n   {p.text}")
+            lines.append(f"\n{i}. ⏰ {t}\n   {display_text_without_time(p, s.timezone_offset)}")
 
         # Без Markdown — названия команд могут содержать спецсимволы (_ * [ ])
         try:
@@ -793,7 +794,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         rlines = [f"📥 Админ добавил +{added} прогнозов"]
                         for p in preds[-added:]:
                             t = format_time_local(p, rs.timezone_offset)
-                            rlines.append(f"⏰ {t}  {p.text}")
+                            rlines.append(f"⏰ {t}  {display_text_without_time(p, rs.timezone_offset)}")
                         await ctx.bot.send_message(chat_id=rid, text="\n".join(rlines))
                     except Exception as e:
                         logger.error(f"broadcast add to {rid} failed: {e}")
