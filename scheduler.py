@@ -11,8 +11,8 @@ import auth
 from parser import format_reminder
 from fonbet import (
     fetch_events, find_matching_event, extract_teams_from_prediction,
-    check_crookedness, build_match_url, format_bet_odds, has_relevant_odds,
-    parse_bet_from_prediction,
+    check_crookedness, check_close_match, build_match_url, format_bet_odds,
+    has_relevant_odds, parse_bet_from_prediction,
 )
 import bookmakers
 
@@ -39,6 +39,7 @@ _tick_counter = 0
 _sent_prematch: set = set()
 _sent_live: set = set()
 _sent_crooked: set = set()
+_sent_close_match: set = set()
 
 # Лок чтобы тики не накладывались друг на друга (тик может длиться >15 сек)
 _fonbet_lock = asyncio.Lock()
@@ -288,6 +289,25 @@ async def _fonbet_tick_inner(app: Application):
                 asyncio.create_task(
                     _bookmakers_followup(app, pred, team1, team2, field)
                 )
+            elif not pred.close_match_notified and pred.id not in _sent_close_match:
+                # Матч ещё не "кривой", но кэф уже близко подошёл к порогу —
+                # даём знать заранее, до того как сработает основное уведомление.
+                close = check_close_match(pred.text, event)
+                if close:
+                    _sent_close_match.add(pred.id)
+                    pred.close_match_notified = True
+                    changed = True
+                    status = "🔴 ЛАЙВ" if close["is_live"] else "📋 ЛИНИЯ"
+                    msg = (
+                        f"🎯 Высокое совпадение коэффициента! ({status})\n"
+                        f"{close['team1']} — {close['team2']}\n"
+                        f"⚡ {close['reason']}\n"
+                        f"{close['odds_info']}"
+                    )
+                    await _broadcast(app, recipients_for("notify_close_match"), msg, url=close.get("url"))
+                    logger.info(
+                        f"[fonbet CLOSE_MATCH] {team1} — {team2}: {close['reason']}"
+                    )
 
     # Сохраняем флаги ОДИН раз в конце тика (батч) — снижает нагрузку на Gist API
     if changed:

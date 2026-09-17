@@ -598,8 +598,10 @@ def parse_bet_from_prediction(text: str) -> Optional[dict]:
     """
     Извлекает тип ставки и порог из текста прогноза.
 
-    Победитель:
+    Победитель (конкретная команда):
       'п1 4+' / 'п2 3+' / 'P1 5+' → {type: 'win', team: 1|2, threshold: 4.0}
+    Победитель (любая из команд — без указания п1/п2, порог в конце строки):
+      '... Team A — Team B 7+' → {type: 'win_any', threshold: 7.0}
     Фора:
       'ф1-2,5' / 'ф2 -3.5' / 'Ф1 -4,5' → {type: 'handicap', team: 1|2, value: -2.5}
 
@@ -630,6 +632,17 @@ def parse_bet_from_prediction(text: str) -> Optional[dict]:
         team = int(m.group(1))
         threshold = float(m.group(2))
         return {"type": "win", "team": team, "threshold": threshold}
+
+    # ── Победитель: ЛЮБАЯ команда, без "п1"/"п2" ──
+    # Прогноз типа "... Team A — Team B 7+" означает: кривой, если кэф
+    # ЛЮБОЙ из двух команд ≥ порога. Порог должен стоять в самом конце
+    # строки (после названий команд), чтобы не спутать со временем матча
+    # (17-00) или другими числами в тексте.
+    cleaned = re.sub(r'^.*?\d{1,2}[-:]\d{2}\s*', '', text).strip()
+    m = _re.search(r'(\d+)\s*\+\s*$', cleaned)
+    if m:
+        threshold = float(m.group(1))
+        return {"type": "win_any", "threshold": threshold}
 
     return None
 
@@ -671,8 +684,10 @@ def check_crookedness(pred_text: str, event: dict) -> Optional[dict]:
     if not bet:
         return None
 
+    # Форе нужен список факторов чтобы искать нужный код/pt; победителю (win/win_any)
+    # факторы не нужны — там используются готовые odd_p1/odd_p2.
     factors = event.get("factors", [])
-    if not factors:
+    if bet["type"] == "handicap" and not factors:
         return None
 
     crooked = False
@@ -709,6 +724,27 @@ def check_crookedness(pred_text: str, event: dict) -> Optional[dict]:
             kind = "underdog"
             other = 2 if bet["team"] == 1 else 1
             reason = f"П{other} = {opp:.2f} (≥ {UNDERDOG_THRESHOLD:g})"
+
+        p1s = f"{odd_p1:.2f}" if odd_p1 else "—"
+        p2s = f"{odd_p2:.2f}" if odd_p2 else "—"
+        odds_info = f"П1: {p1s}  |  П2: {p2s}"
+
+    elif bet["type"] == "win_any":
+        # Победитель, любая из команд: кривой если МАКСИМАЛЬНЫЙ из двух кэфов
+        # дошёл до порога прогноза (не важно, П1 это или П2).
+        threshold = bet["threshold"]
+        odd_p1 = event.get("odd_p1")
+        odd_p2 = event.get("odd_p2")
+
+        candidates = [(1, odd_p1), (2, odd_p2)]
+        candidates = [(team, odd) for team, odd in candidates if odd is not None]
+
+        if candidates:
+            team, odd = max(candidates, key=lambda c: c[1])
+            if odd >= threshold:
+                crooked = True
+                kind = "crooked"
+                reason = f"П{team} = {odd:.2f} (≥ {threshold:g})"
 
         p1s = f"{odd_p1:.2f}" if odd_p1 else "—"
         p2s = f"{odd_p2:.2f}" if odd_p2 else "—"
@@ -765,6 +801,113 @@ def check_crookedness(pred_text: str, event: dict) -> Optional[dict]:
     }
 
 
+# Порог "близости" к кривому: кэф считается близким если он в диапазоне
+# [CLOSE_MATCH_RATIO * порог_кривизны, порог_кривизны). Если кэф уже достиг
+# порога — это уже "кривой", а не "близкий" (обрабатывается check_crookedness).
+CLOSE_MATCH_RATIO = 0.8
+
+
+def check_close_match(pred_text: str, event: dict) -> Optional[dict]:
+    """
+    Проверяет, насколько кэф на ставку прогноза близок к порогу "кривизны",
+    но ещё не дошёл до него (сам "кривой" случай уже покрыт check_crookedness).
+
+    Порог кривизны берётся тот же, что и в check_crookedness:
+      - Победитель: собственный порог прогноза (напр. "п1 4+" → порог 4.0)
+      - Фора малая (|value| ≤ 2.5): порог 3.0
+      - Фора большая (|value| > 2.5): порог 2.5 (по форе матча)
+
+    "Близкий" — если кэф/порог ≥ CLOSE_MATCH_RATIO (0.8) и кэф < порог.
+
+    Возвращает dict с описанием если близко, иначе None:
+      {team1, team2, is_live, reason, odds_info, url, ratio}
+    """
+    bet = parse_bet_from_prediction(pred_text)
+    if not bet:
+        return None
+
+    factors = event.get("factors", [])
+
+    if bet["type"] == "win":
+        threshold = bet["threshold"]
+        odd_p1 = event.get("odd_p1")
+        odd_p2 = event.get("odd_p2")
+
+        if bet["team"] == 1:
+            own = odd_p1
+        else:
+            own = odd_p2
+
+        if own is None or threshold <= 0:
+            return None
+
+        ratio = own / threshold
+        if ratio < CLOSE_MATCH_RATIO or own >= threshold:
+            return None
+
+        reason = f"П{bet['team']} = {own:.2f} (порог {threshold:g}, {ratio*100:.0f}%)"
+        p1s = f"{odd_p1:.2f}" if odd_p1 else "—"
+        p2s = f"{odd_p2:.2f}" if odd_p2 else "—"
+        odds_info = f"П1: {p1s}  |  П2: {p2s}"
+
+    elif bet["type"] == "win_any":
+        # Любая из команд: берём максимальный из двух кэфов и сравниваем с порогом.
+        threshold = bet["threshold"]
+        odd_p1 = event.get("odd_p1")
+        odd_p2 = event.get("odd_p2")
+
+        candidates = [(1, odd_p1), (2, odd_p2)]
+        candidates = [(team, odd) for team, odd in candidates if odd is not None]
+
+        if not candidates or threshold <= 0:
+            return None
+
+        team, own = max(candidates, key=lambda c: c[1])
+        ratio = own / threshold
+        if ratio < CLOSE_MATCH_RATIO or own >= threshold:
+            return None
+
+        reason = f"П{team} = {own:.2f} (порог {threshold:g}, {ratio*100:.0f}%)"
+        p1s = f"{odd_p1:.2f}" if odd_p1 else "—"
+        p2s = f"{odd_p2:.2f}" if odd_p2 else "—"
+        odds_info = f"П1: {p1s}  |  П2: {p2s}"
+
+    elif bet["type"] == "handicap":
+        value = bet["value"]
+        team = bet["team"]
+
+        if team == 1:
+            match_codes = HANDICAP_MATCH_TEAM1
+        else:
+            match_codes = HANDICAP_MATCH_TEAM2
+
+        match_handicap_odd = _find_factor(factors, match_codes, value)
+        if match_handicap_odd is None:
+            return None
+
+        threshold = 3.0 if abs(value) <= 2.5 else 2.5
+
+        ratio = match_handicap_odd / threshold
+        if ratio < CLOSE_MATCH_RATIO or match_handicap_odd >= threshold:
+            return None
+
+        reason = f"Ф{team} {value:g} = {match_handicap_odd:.2f} (порог {threshold:g}, {ratio*100:.0f}%)"
+        odds_info = f"Ф{team} {value:g}: {match_handicap_odd:.2f}"
+
+    else:
+        return None
+
+    return {
+        "team1": event["team1"],
+        "team2": event["team2"],
+        "is_live": event["is_live"],
+        "reason": reason,
+        "odds_info": odds_info,
+        "url": build_match_url(event),
+        "ratio": ratio,
+    }
+
+
 def has_relevant_odds(pred_text: str, event: dict) -> bool:
     """
     True если у события есть коэффициенты релевантные ставке прогноза.
@@ -773,7 +916,7 @@ def has_relevant_odds(pred_text: str, event: dict) -> bool:
     bet = parse_bet_from_prediction(pred_text)
     factors = event.get("factors", [])
 
-    if not bet or bet["type"] == "win":
+    if not bet or bet["type"] in ("win", "win_any"):
         return event.get("odd_p1") is not None or event.get("odd_p2") is not None
 
     # Фора
@@ -811,7 +954,7 @@ def format_bet_odds(pred_text: str, event: dict) -> str:
         p2s = f"{p2:.2f}" if p2 else "—"
         return f"П1: {p1s}  |  П2: {p2s}"
 
-    if not bet or bet["type"] == "win":
+    if not bet or bet["type"] in ("win", "win_any"):
         return win_line()
 
     # Фора

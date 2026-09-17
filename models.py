@@ -15,6 +15,7 @@ class Prediction:
     fonbet_notified_live: bool = False
     crooked_notified: bool = False
     leon_notified: bool = False
+    close_match_notified: bool = False
     source: str = "manual"
 
     def to_dict(self) -> dict:
@@ -28,6 +29,7 @@ class Prediction:
             "fonbet_notified_live": self.fonbet_notified_live,
             "crooked_notified": self.crooked_notified,
             "leon_notified": self.leon_notified,
+            "close_match_notified": self.close_match_notified,
             "source": self.source,
         }
 
@@ -43,6 +45,7 @@ class Prediction:
             fonbet_notified_live=d.get("fonbet_notified_live", False),
             crooked_notified=d.get("crooked_notified", False),
             leon_notified=d.get("leon_notified", False),
+            close_match_notified=d.get("close_match_notified", False),
             source=d.get("source", "manual"),
         )
 
@@ -56,6 +59,7 @@ class UserSettings:
     notify_match_out: bool = True        # выход матча в линию/лайв (Фонбет)
     notify_crooked: bool = True          # кривые матчи (value)
     notify_underdog: bool = True         # андердог (кэф на соперника 8+)
+    notify_close_match: bool = True      # высокое совпадение (кэф близок к кривому, но не дошёл)
     notify_new_preds: bool = True        # новые прогнозы из Discord
     notify_voice: bool = True            # заход/выход в голосовой Discord
     # Legacy-поле (раньше отвечало за прематч+лайв+кривые). Оставляем для миграции.
@@ -69,6 +73,7 @@ class UserSettings:
             "notify_match_out": self.notify_match_out,
             "notify_crooked": self.notify_crooked,
             "notify_underdog": self.notify_underdog,
+            "notify_close_match": self.notify_close_match,
             "notify_new_preds": self.notify_new_preds,
             "notify_voice": self.notify_voice,
             "fonbet_notifications": self.fonbet_notifications,
@@ -86,6 +91,7 @@ class UserSettings:
             notify_crooked=d.get("notify_crooked", legacy_fonbet),
             # Новый тумблер: если его ещё нет в Gist — наследуем от «кривых матчей»
             notify_underdog=d.get("notify_underdog", d.get("notify_crooked", legacy_fonbet)),
+            notify_close_match=d.get("notify_close_match", d.get("notify_crooked", legacy_fonbet)),
             notify_new_preds=d.get("notify_new_preds", True),
             notify_voice=d.get("notify_voice", True),
             fonbet_notifications=legacy_fonbet,

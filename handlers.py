@@ -249,6 +249,7 @@ def _settings_keyboard(s):
         [InlineKeyboardButton(f"{mark(s.notify_match_out)} 🔴 Выход матчей (линия/лайв)", callback_data="tg_matchout")],
         [InlineKeyboardButton(f"{mark(s.notify_crooked)} 💰 Кривые матчи", callback_data="tg_crooked")],
         [InlineKeyboardButton(f"{mark(s.notify_underdog)} 🐶 Андердоги", callback_data="tg_underdog")],
+        [InlineKeyboardButton(f"{mark(s.notify_close_match)} 🎯 Высокое совпадение", callback_data="tg_closematch")],
         [InlineKeyboardButton(f"{mark(s.notify_new_preds)} 📥 Новые прогнозы", callback_data="tg_newpreds")],
         [InlineKeyboardButton(f"{mark(s.notify_voice)} 🎧 Заход в войс Discord", callback_data="tg_voice")],
     ])
@@ -908,13 +909,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
     elif q.data in ("tg_reminders", "tg_matchout", "tg_crooked",
-                    "tg_underdog", "tg_newpreds", "tg_voice"):
+                    "tg_underdog", "tg_closematch", "tg_newpreds", "tg_voice"):
         # Атомарное переключение — защита от затирания при быстрых нажатиях
         field_map = {
             "tg_reminders": "notify_reminders",
             "tg_matchout": "notify_match_out",
             "tg_crooked": "notify_crooked",
             "tg_underdog": "notify_underdog",
+            "tg_closematch": "notify_close_match",
             "tg_newpreds": "notify_new_preds",
             "tg_voice": "notify_voice",
         }
