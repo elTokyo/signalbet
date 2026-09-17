@@ -190,35 +190,44 @@ async def _fonbet_tick_inner(app: Application):
         # Коэффициенты под тип ставки (победитель → П1/П2, фора → кэф форы)
         odds_line = format_bet_odds(pred.text, event)
         match_url = build_match_url(event)
+        diff_min = (pred.match_time - now).total_seconds() / 60
 
         if event["is_live"] and not pred.fonbet_notified_live and pred.id not in _sent_live:
-            # Помечаем в in-memory множествах ДО отправки (защита от дублей в процессе)
-            _sent_live.add(pred.id)
-            _sent_prematch.add(pred.id)
-            was_in_line = pred.fonbet_notified_prematch
-            pred.fonbet_notified_live = True
-            # Матч уже не вернётся в линию — закрываем и этот флаг
-            pred.fonbet_notified_prematch = True
-            changed = True
-            # Если линии не было вообще (матч открыли сразу в лайве) — говорим об этом прямо
-            head = "🔴 Матч вышел в ЛАЙВ!" if was_in_line else "🔴 Матч открыт сразу в ЛАЙВЕ!"
-            msg = (
-                f"{head}\n"
-                f"{team1} — {team2}\n"
-                f"{odds_line}"
-            )
-            if not was_in_line:
-                msg += f"\n\n📝 Прогноз:\n{pred.text}"
-            await _broadcast(app, recipients_for("notify_match_out"), msg, url=match_url)
-            logger.info(
-                f"[fonbet LIVE] {team1} — {team2} "
-                f"(признак: {event.get('live_reason')}, линия была: {was_in_line})"
-            )
+            # Как и для линии — ждём релевантные коэффициенты, не шлём уведомление без кэфов.
+            has_odds = has_relevant_odds(pred.text, event)
+            # Дедлайн ожидания — синхронизирован с окном мониторинга (после этого матч
+            # всё равно перестанем проверять), чтобы не ждать кэфы вечно.
+            past_deadline = diff_min < -(FONBET_WINDOW_AFTER_MIN - 5)
+
+            if has_odds or past_deadline:
+                # Помечаем в in-memory множествах ДО отправки (защита от дублей в процессе)
+                _sent_live.add(pred.id)
+                _sent_prematch.add(pred.id)
+                was_in_line = pred.fonbet_notified_prematch
+                pred.fonbet_notified_live = True
+                # Матч уже не вернётся в линию — закрываем и этот флаг
+                pred.fonbet_notified_prematch = True
+                changed = True
+                head = "🔴 Матч вышел в лайв!"
+                odds_part = odds_line if has_odds else "(коэф. так и не появились)"
+                msg = (
+                    f"{head}\n"
+                    f"{team1} — {team2}\n"
+                    f"{odds_part}"
+                )
+                if not was_in_line:
+                    msg += f"\n\n📝 Прогноз:\n{pred.text}"
+                await _broadcast(app, recipients_for("notify_match_out"), msg, url=match_url)
+                logger.info(
+                    f"[fonbet LIVE{'' if has_odds else ' no-odds timeout'}] {team1} — {team2} "
+                    f"(признак: {event.get('live_reason')}, линия была: {was_in_line})"
+                )
+            else:
+                logger.info(f"[fonbet LIVE waiting odds] {team1} — {team2}")
 
         elif (not event["is_live"]) and not pred.fonbet_notified_prematch and pred.id not in _sent_prematch:
             # Есть ли релевантные коэффициенты под ставку прогноза?
             has_odds = has_relevant_odds(pred.text, event)
-            diff_min = (pred.match_time - now).total_seconds() / 60
             past_deadline = diff_min < -10
 
             if has_odds:
