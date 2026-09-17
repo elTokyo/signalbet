@@ -246,9 +246,11 @@ def _settings_keyboard(s):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🌐 Часовой пояс: UTC+{s.timezone_offset}", callback_data="set_tz")],
         [InlineKeyboardButton(f"{mark(s.notify_reminders)} 🔔 Напоминания (30/5 мин)", callback_data="tg_reminders")],
-        [InlineKeyboardButton(f"{mark(s.notify_match_out)} 🔴 Выход матчей (Фонбет)", callback_data="tg_matchout")],
+        [InlineKeyboardButton(f"{mark(s.notify_match_out)} 🔴 Выход матчей (линия/лайв)", callback_data="tg_matchout")],
         [InlineKeyboardButton(f"{mark(s.notify_crooked)} 💰 Кривые матчи", callback_data="tg_crooked")],
+        [InlineKeyboardButton(f"{mark(s.notify_underdog)} 🐶 Андердоги", callback_data="tg_underdog")],
         [InlineKeyboardButton(f"{mark(s.notify_new_preds)} 📥 Новые прогнозы", callback_data="tg_newpreds")],
+        [InlineKeyboardButton(f"{mark(s.notify_voice)} 🎧 Заход в войс Discord", callback_data="tg_voice")],
     ])
 
 
@@ -543,7 +545,8 @@ async def cmd_checkfonbet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             if event:
                 found_count += 1
-                status = "🔴 LIVE" if event["is_live"] else "📋 Прематч"
+                status = "🔴 ЛАЙВ" if event["is_live"] else "📋 ЛИНИЯ"
+                status += f" [{event.get('live_reason')}]"
                 odds = ""
                 if event.get("odd_p1") or event.get("odd_p2"):
                     p1 = f"{event['odd_p1']:.2f}" if event.get("odd_p1") else "—"
@@ -641,7 +644,7 @@ async def cmd_factors(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     factors = result.get("factors", [])
-    status = "🔴 LIVE" if result["is_live"] else "📋 Прематч"
+    status = "🔴 ЛАЙВ" if result["is_live"] else "📋 ЛИНИЯ"
 
     lines = [
         f"{status}  (совпадение {result.get('match_score')}%)",
@@ -680,6 +683,75 @@ async def cmd_factors(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         while rest:
             await update.message.reply_text(rest[:4000])
             rest = rest[4000:]
+
+
+@require_admin
+async def cmd_bk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Проверка других контор (BetBoom / Winline / Лига Ставок) по прогнозу из листа.
+    Использование: /bk        — первый прогноз
+                   /bk 3      — прогноз №3 из /list
+    Показывает, нашёлся ли матч и есть ли рынок из прогноза.
+    """
+    import fonbet
+    import bookmakers
+
+    predictions = storage.load_predictions()
+    if not predictions:
+        await update.message.reply_text("📋 Список пуст. Добавь прогноз через /add")
+        return
+
+    idx = 0
+    if ctx.args:
+        try:
+            idx = int(ctx.args[0]) - 1
+            if idx < 0 or idx >= len(predictions):
+                await update.message.reply_text(f"❌ Нет прогноза №{ctx.args[0]}. Всего: {len(predictions)}")
+                return
+        except ValueError:
+            await update.message.reply_text("❌ Укажи номер: /bk 3")
+            return
+
+    pred = predictions[idx]
+    team1, team2 = fonbet.extract_teams_from_prediction(pred.text)
+    bet = fonbet.parse_bet_from_prediction(pred.text)
+
+    if not bet:
+        await update.message.reply_text(
+            f"❌ Не смог распознать ставку в прогнозе:\n{pred.text[:120]}"
+        )
+        return
+
+    msg = await update.message.reply_text(
+        f"🔄 Проверяю конторы:\n{team1} — {team2}\n"
+        f"Рынок: {bet['type']} {bet.get('value') or bet.get('team')}"
+    )
+
+    try:
+        import asyncio
+        results = await asyncio.to_thread(
+            bookmakers.check_all, team1, team2, bet, pred.match_time
+        )
+    except Exception as e:
+        logger.exception(f"/bk error: {e}")
+        await msg.edit_text(f"❌ Ошибка: {e}")
+        return
+
+    lines = [f"{team1} — {team2}", ""]
+    for r in results:
+        if r["status"] == "ok":
+            lines.append(f"✅ {r['name']}: {r['label']} = {r['odd']:.2f}"
+                         + (" 🔴 лайв" if r["is_live"] else ""))
+        elif r["status"] == "no_market":
+            lines.append(f"➖ {r['name']}: матч есть, рынка {r['label']} нет")
+        elif r["status"] == "no_match":
+            lines.append(f"❌ {r['name']}: матч не найден")
+        else:
+            lines.append(f"⚠️ {r['name']}: контора не ответила / формат не распознан")
+
+    lines.append("")
+    lines.append("Если контора не отвечает — запусти bk_probe.py (см. README).")
+    await msg.edit_text("\n".join(lines))
 
 
 # ── Обработка текста ─────────────────────────────────────────────────────────
@@ -835,13 +907,16 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
 
-    elif q.data in ("tg_reminders", "tg_matchout", "tg_crooked", "tg_newpreds"):
+    elif q.data in ("tg_reminders", "tg_matchout", "tg_crooked",
+                    "tg_underdog", "tg_newpreds", "tg_voice"):
         # Атомарное переключение — защита от затирания при быстрых нажатиях
         field_map = {
             "tg_reminders": "notify_reminders",
             "tg_matchout": "notify_match_out",
             "tg_crooked": "notify_crooked",
+            "tg_underdog": "notify_underdog",
             "tg_newpreds": "notify_new_preds",
+            "tg_voice": "notify_voice",
         }
         s = storage.toggle_setting(user_id, field_map[q.data])
         await q.edit_message_text(

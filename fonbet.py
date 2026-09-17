@@ -39,6 +39,16 @@ HEADERS = {
 
 FUZZY_THRESHOLD = 80   # минимальный % совпадения команд (token_sort_ratio)
 
+# ── Строгое определение ЛАЙВ / ЛИНИЯ ─────────────────────────────────────────
+# Раньше статус брался только из полей live/inLive/isLive. У Фонбета в
+# /ma/events/list эти поля есть не всегда — из-за чего идущий матч показывался
+# как «прематч». Теперь статус определяется по нескольким признакам подряд,
+# и последний из них — время старта: если время матча уже наступило, это лайв.
+LIVE_TIME_GRACE_SEC = 0   # 0 = лайв ровно с момента старта по расписанию
+
+# Порог «андердога»: кэф на соперника той команды, на которую прогноз.
+UNDERDOG_THRESHOLD = 8.0
+
 # ── Коды факторов Фонбета (определены эмпирически через /factors + сверку с сайтом) ──
 # Победители основного времени
 CODE_WIN1 = 921   # П1
@@ -118,6 +128,78 @@ def get_working_host() -> Optional[str]:
         return None
 
 
+# ── Определение статуса события ──────────────────────────────────────────────
+
+def _collect_live_ids(data: dict) -> set:
+    """
+    Собирает id событий, которые ТОЧНО идут прямо сейчас: у Фонбета рядом со
+    списком событий приходят блоки со счётом/таймером (eventMiscs и т.п.) —
+    они появляются только у начавшихся матчей.
+    """
+    ids = set()
+    for key in ("eventMiscs", "eventBlocks", "liveEvents", "eventMisc"):
+        entries = data.get(key)
+        if not isinstance(entries, list):
+            continue
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            eid = e.get("id") or e.get("e") or e.get("eventId")
+            if eid is None:
+                continue
+            live_markers = (
+                "score1", "score2", "score", "timerSeconds", "timer",
+                "matchTime", "scoreboard", "period", "currentPeriod",
+            )
+            if any(m in e for m in live_markers):
+                ids.add(eid)
+    return ids
+
+
+def detect_live(ev: dict, live_ids: set = None, now_ts: float = None) -> tuple[bool, str]:
+    """
+    Строгий ответ на вопрос «матч уже в лайве или ещё в линии?».
+    Возвращает (is_live, причина). Причина пишется в лог и в /checkfonbet —
+    по ней видно, какой именно признак сработал.
+
+    Порядок проверок (первое срабатывание побеждает):
+      1. явные флаги live / inLive / isLive
+      2. поле place/state со словом live
+      3. событие есть в блоках со счётом/таймером (см. _collect_live_ids)
+      4. время старта уже наступило → лайв
+    Если ничего не сработало — это ЛИНИЯ (прематч).
+    """
+    live_ids = live_ids or set()
+    if now_ts is None:
+        now_ts = time.time()
+
+    for key in ("live", "inLive", "isLive"):
+        if ev.get(key):
+            return True, f"flag:{key}"
+
+    place = str(ev.get("place") or ev.get("state") or "").lower()
+    if "live" in place:
+        return True, "place"
+
+    if ev.get("id") in live_ids:
+        return True, "scoreboard"
+
+    start_raw = ev.get("startTime") or ev.get("start") or ev.get("time")
+    if start_raw:
+        try:
+            if now_ts >= int(start_raw) + LIVE_TIME_GRACE_SEC:
+                return True, "time"
+        except (ValueError, TypeError):
+            pass
+
+    return False, "line"
+
+
+def status_label(event: dict) -> str:
+    """Человеческий статус для сообщений: ЛАЙВ или ЛИНИЯ."""
+    return "🔴 ЛАЙВ" if event.get("is_live") else "📋 ЛИНИЯ"
+
+
 # ── Запрос событий ───────────────────────────────────────────────────────────
 
 def fetch_events() -> list[dict]:
@@ -158,6 +240,9 @@ def fetch_events() -> list[dict]:
     # У Фонбета прематч-матчи часто не имеют прямого sportId (он у турнира-родителя),
     # поэтому фильтрация по sportId выбрасывала почти все события.
     events_map = {}
+    live_ids = _collect_live_ids(data)
+    now_ts = time.time()
+    live_count = 0
     for ev in raw_events:
         team1 = ev.get("team1") or ev.get("name1") or ""
         team2 = ev.get("team2") or ev.get("name2") or ""
@@ -174,6 +259,10 @@ def fetch_events() -> list[dict]:
             if isinstance(pids, list) and pids:
                 league_id = pids[0]
 
+        is_live, live_reason = detect_live(ev, live_ids, now_ts)
+        if is_live:
+            live_count += 1
+
         events_map[ev.get("id")] = {
             "id": ev.get("id"),
             "league_id": league_id,
@@ -181,13 +270,17 @@ def fetch_events() -> list[dict]:
             "start_time": ev.get("startTime") or ev.get("start") or ev.get("time"),
             "team1": team1,
             "team2": team2,
-            "is_live": bool(ev.get("live") or ev.get("inLive") or ev.get("isLive")),
+            "is_live": is_live,
+            "live_reason": live_reason,
             "odd_p1": None,
             "odd_p2": None,
             "factors": [],   # все факторы: [{f: код, v: кэф, pt: значение}, ...]
         }
 
-    logger.info(f"Fonbet events с двумя командами: {len(events_map)}")
+    logger.info(
+        f"Fonbet events с двумя командами: {len(events_map)} "
+        f"(из них лайв: {live_count}, линия: {len(events_map) - live_count})"
+    )
 
     # Парсим customFactors — там лежат коэффициенты
     # Структура: customFactors -> [{e: eventId, factors: [{f: factorType, v: value, pt: param}, ...]}]
@@ -249,6 +342,9 @@ def dump_event_factors(pred_text: str) -> Optional[dict]:
     target_raw = None
     best_score = 0
 
+    live_ids = _collect_live_ids(data)
+    now_ts = time.time()
+
     p1 = pred_t1.lower()
     p2 = pred_t2.lower() if pred_t2 else ""
 
@@ -268,10 +364,12 @@ def dump_event_factors(pred_text: str) -> Optional[dict]:
             best_score = score
             target_id = ev.get("id")
             target_raw = ev   # сохраняем сырое событие для диагностики
+            _is_live, _reason = detect_live(ev, live_ids, now_ts)
             target_info = {
                 "team1": team1,
                 "team2": team2,
-                "is_live": bool(ev.get("live") or ev.get("inLive") or ev.get("isLive")),
+                "is_live": _is_live,
+                "live_reason": _reason,
             }
 
     if not target_id or best_score < FUZZY_THRESHOLD:
@@ -471,7 +569,7 @@ def find_matching_event(pred_text: str, events: list[dict],
         f"Fonbet match [{score:.0f}%, возраст+время+команды]: "
         f"'{pred_t1} vs {pred_t2}' → "
         f"'{event['team1']} vs {event['team2']}' "
-        f"({'LIVE' if event['is_live'] else 'Prematch'})"
+        f"({'LIVE' if event['is_live'] else 'LINE'}, признак: {event.get('live_reason')})"
     )
     return event
 
@@ -561,7 +659,13 @@ def check_crookedness(pred_text: str, event: dict) -> Optional[dict]:
     event — словарь из fetch_events (с полем 'factors').
 
     Возвращает dict с описанием если матч кривой, иначе None:
-      {team1, team2, is_live, reason, odds_info}
+      {team1, team2, is_live, kind, reason, odds_info}
+
+    kind:
+      "crooked"  — обычная кривизна (кэф на СВОЮ команду дошёл до порога прогноза,
+                   или сработало форовое условие)
+      "underdog" — кэф на СОПЕРНИКА ≥ 8.0 (собака)
+    Если сработали оба условия сразу — отдаём "crooked" (с кэфами обеих команд).
     """
     bet = parse_bet_from_prediction(pred_text)
     if not bet:
@@ -572,6 +676,7 @@ def check_crookedness(pred_text: str, event: dict) -> Optional[dict]:
         return None
 
     crooked = False
+    kind = "crooked"
     reason = ""
     odds_info = ""
 
@@ -587,14 +692,23 @@ def check_crookedness(pred_text: str, event: dict) -> Optional[dict]:
         else:
             own, opp = odd_p2, odd_p1
 
-        # Кривой если: кэф на свою ≥ порог, ИЛИ кэф на чужую ≥ 8.0
-        if own is not None and own >= threshold:
+        # Кривой если кэф на свою ≥ порог; андердог если кэф на чужую ≥ 8.0.
+        # Оба сразу → это кривой матч (в тексте всё равно видны оба кэфа).
+        own_crooked = own is not None and own >= threshold
+        is_underdog = opp is not None and opp >= UNDERDOG_THRESHOLD
+
+        if own_crooked:
             crooked = True
-            reason = f"П{bet['team']} ≥ {threshold:g}"
-        elif opp is not None and opp >= 8.0:
+            kind = "crooked"
+            reason = f"П{bet['team']} = {own:.2f} (≥ {threshold:g})"
+            if is_underdog:
+                other = 2 if bet["team"] == 1 else 1
+                reason += f", П{other} = {opp:.2f} (собака)"
+        elif is_underdog:
             crooked = True
+            kind = "underdog"
             other = 2 if bet["team"] == 1 else 1
-            reason = f"П{other} ≥ 8.0 (можно тащить андердога)"
+            reason = f"П{other} = {opp:.2f} (≥ {UNDERDOG_THRESHOLD:g})"
 
         p1s = f"{odd_p1:.2f}" if odd_p1 else "—"
         p2s = f"{odd_p2:.2f}" if odd_p2 else "—"
@@ -644,6 +758,7 @@ def check_crookedness(pred_text: str, event: dict) -> Optional[dict]:
         "team1": event["team1"],
         "team2": event["team2"],
         "is_live": event["is_live"],
+        "kind": kind,
         "reason": reason,
         "odds_info": odds_info,
         "url": build_match_url(event),

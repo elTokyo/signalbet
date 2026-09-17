@@ -48,6 +48,7 @@ models = _load('models')
 parser = _load('parser')
 fonbet = _load('fonbet')
 discord_listener = _load('discord_listener')
+bookmakers = _load('bookmakers')
 
 # Счётчики
 _passed = 0
@@ -415,6 +416,122 @@ def test_notify_grouping():
           any("/list" in m for m in msg))
 
 
+def test_live_detection():
+    """Строгое определение ЛАЙВ / ЛИНИЯ (п.1 апдейта)."""
+    print("\n[Определение лайв/линия]")
+    import time as _t
+    now = _t.time()
+
+    is_live, reason = fonbet.detect_live({"id": 1, "startTime": now + 3600}, set(), now)
+    check("Матч через час → линия", is_live is False and reason == "line")
+
+    is_live, reason = fonbet.detect_live({"id": 2, "startTime": now - 30}, set(), now)
+    check("Время старта прошло → лайв (по времени)", is_live is True and reason == "time")
+
+    is_live, reason = fonbet.detect_live({"id": 3, "startTime": now + 600, "live": True}, set(), now)
+    check("Флаг live → лайв", is_live is True and reason.startswith("flag"))
+
+    is_live, reason = fonbet.detect_live({"id": 4, "startTime": now + 600, "place": "live"}, set(), now)
+    check("Поле place=live → лайв", is_live is True and reason == "place")
+
+    is_live, reason = fonbet.detect_live({"id": 5, "startTime": now + 600}, {5}, now)
+    check("Есть блок со счётом → лайв", is_live is True and reason == "scoreboard")
+
+    live_ids = fonbet._collect_live_ids({"eventMiscs": [
+        {"id": 7, "score1": 1, "score2": 0}, {"id": 8, "someOtherField": 1},
+    ]})
+    check("_collect_live_ids берёт только события со счётом/таймером", live_ids == {7})
+
+
+def test_underdog():
+    """Разделение кривого матча и андердога (п.2 апдейта)."""
+    print("\n[Андердог vs кривой]")
+    base = {"team1": "A", "team2": "B", "is_live": False, "id": 1, "league_id": 1,
+            "factors": [{"f": 921, "v": 1.2, "pt": None}]}
+    text = "Футбол. Чехия. 19-00 A — B п1 4+"
+
+    r = fonbet.check_crookedness(text, dict(base, odd_p1=1.2, odd_p2=9.5))
+    check("Кэф на соперника 9.5 → андердог", r and r["kind"] == "underdog")
+
+    r = fonbet.check_crookedness(text, dict(base, odd_p1=1.2, odd_p2=8.0))
+    check("Ровно 8.0 → андердог (порог включительно)", r and r["kind"] == "underdog")
+
+    r = fonbet.check_crookedness(text, dict(base, odd_p1=1.2, odd_p2=7.99))
+    check("7.99 → ничего", r is None)
+
+    r = fonbet.check_crookedness(text, dict(base, odd_p1=4.5, odd_p2=9.5))
+    check("Оба условия → кривой матч (не андердог)", r and r["kind"] == "crooked")
+    check("В причине кривого видно и собаку", r and "собака" in r["reason"])
+    check("Видны кэфы обеих команд", r and "П1: 4.50" in r["odds_info"] and "П2: 9.50" in r["odds_info"])
+
+    r = fonbet.check_crookedness("Футбол. 19-00 A — B ф1-2,5",
+                                 dict(base, factors=[{"f": 927, "v": 9.0, "pt": -2.5}]))
+    check("Для форы андердог не проверяется", r is None or r["kind"] == "crooked")
+
+
+def test_bookmakers_parser():
+    """Универсальный разбор ответов других контор (п.3 апдейта)."""
+    print("\n[Парсер других контор]")
+
+    shapes = {
+        "формат с competitors": {"data": [{
+            "competitors": [{"name": "Уния", "homeAway": "HOME"},
+                            {"name": "Спуйня", "homeAway": "AWAY"}],
+            "kickoff": 1758200000000, "betline": "prematch",
+            "markets": [{"name": "1X2", "runners": [{"name": "П1", "price": 1.45},
+                                                    {"name": "П2", "price": 8.90}]},
+                        {"name": "Фора", "runners": [{"name": "Ф2", "price": 2.55,
+                                                      "handicap": -2.5}]}]}]},
+        "формат с name1/name2": {"events": [{
+            "name1": "Уния", "name2": "Спуйня", "startTime": 1758200000, "live": False,
+            "outcomes": [{"caption": "P1", "kf": 1.5}, {"caption": "P2", "kf": 9.1},
+                         {"caption": "Фора 2 (-2.5)", "kf": 2.4, "param": -2.5}]}]},
+        "формат с homeName/awayName": {"result": {"items": [{
+            "homeName": "Уния", "awayName": "Спуйня", "dateStart": "2026-09-18T19:00:00",
+            "markets": {"1": {"P1": {"price": 1.48}, "P2": {"price": 8.2}}}}]}},
+    }
+
+    for label, data in shapes.items():
+        events = []
+        bookmakers._walk_events(data, events)
+        ok = len(events) == 1 and events[0]["team1"] == "Уния" and events[0]["team2"] == "Спуйня"
+        check(f"Команды распознаны: {label}", ok)
+        if ok:
+            check(f"П2 распознан: {label}", bookmakers._find_win(events[0], 2) is not None)
+
+    events = []
+    bookmakers._walk_events(shapes["формат с competitors"], events)
+    check("Фора -2.5 найдена по значению",
+          bookmakers._find_handicap(events[0], 2, -2.5) == 2.55)
+    check("Фора другого значения не подставляется",
+          bookmakers._find_handicap(events[0], 2, -4.5) is None)
+    check("Фаззи-поиск матча работает",
+          bookmakers._match_event(events, "Уния", "Спуйня") is not None)
+    check("Чужой матч не матчится",
+          bookmakers._match_event(events, "Реал", "Барселона") is None)
+
+    check("Пустой результат → сообщение не шлётся",
+          bookmakers.format_results([{"name": "X", "status": "no_match", "odd": None,
+                                      "label": "", "is_live": False}]) is None)
+    txt = bookmakers.format_results([
+        {"name": "BetBoom", "status": "ok", "odd": 9.2, "label": "П2", "is_live": False},
+        {"name": "Winline", "status": "no_match", "odd": None, "label": "П2", "is_live": False},
+    ])
+    check("Найденная контора попадает в текст", txt and "BetBoom" in txt and "9.20" in txt)
+
+
+def test_settings_migration():
+    """Новые тумблеры не ломают старые настройки в Gist."""
+    print("\n[Миграция настроек]")
+    old = {"chat_id": 1, "timezone_offset": 3, "fonbet_notifications": False}
+    s = models.UserSettings.from_dict(old)
+    check("Андердог наследует старый тумблер кривых", s.notify_underdog is False)
+    check("Войс по умолчанию включён", s.notify_voice is True)
+    s2 = models.UserSettings.from_dict(models.UserSettings(chat_id=2).to_dict())
+    check("Круговая сериализация настроек не теряет поля",
+          s2.notify_underdog is True and s2.notify_voice is True)
+
+
 if __name__ == "__main__":
     print("=" * 50)
     print("ТЕСТЫ BET BOT")
@@ -428,6 +545,10 @@ if __name__ == "__main__":
     test_has_odds()
     test_age_markers()
     test_notify_grouping()
+    test_live_detection()
+    test_underdog()
+    test_bookmakers_parser()
+    test_settings_migration()
 
     print("\n" + "=" * 50)
     print(f"Пройдено: {_passed}  |  Провалено: {_failed}")

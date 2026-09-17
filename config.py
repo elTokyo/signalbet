@@ -22,9 +22,28 @@ DISCORD_TOKEN             = os.getenv("DISCORD_TOKEN", "")
 DISCORD_CHANNEL_ID        = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
 DISCORD_TARGET_TG_CHAT_ID = int(os.getenv("DISCORD_TARGET_TG_CHAT_ID", "0"))
 
+# ── Discord: слежение за голосовым каналом ───────────────────────────────────
+# За кем следим и в каком войсе. 0 = функция выключена.
+DISCORD_VOICE_USER_ID    = int(os.getenv("DISCORD_VOICE_USER_ID", "0"))
+DISCORD_VOICE_CHANNEL_ID = int(os.getenv("DISCORD_VOICE_CHANNEL_ID", "0"))
+# Кулдаун между уведомлениями одного типа (сек). Защита от спама при реконнектах.
+VOICE_COOLDOWN_SEC = int(os.getenv("VOICE_COOLDOWN_SEC", "600"))
+# Пауза перед уведомлением о выходе: если человек вернулся за это время —
+# считаем это реконнектом и не шлём ни «вышел», ни «зашёл».
+VOICE_LEAVE_GRACE_SEC = int(os.getenv("VOICE_LEAVE_GRACE_SEC", "60"))
+
 # ── Параметры напоминаний ────────────────────────────────────────────────────
 NOTIFY_BEFORE_MINUTES = [30, 5]
-DELETE_AFTER_MINUTES  = 5
+# Через сколько минут после старта прогноз удаляется из общего листа.
+# Влияет и на окно лайв-мониторинга: после удаления следить уже не за чем.
+DELETE_AFTER_MINUTES  = int(os.getenv("DELETE_AFTER_MINUTES", "5"))
+
+# ── Другие БК (проверка кривых матчей) ───────────────────────────────────────
+# URL можно переопределить переменными окружения, не трогая код —
+# пригодится когда контора сменит эндпоинт (см. bk_probe.py).
+BETBOOM_API_URL    = os.getenv("BETBOOM_API_URL", "")
+WINLINE_API_URL    = os.getenv("WINLINE_API_URL", "")
+LIGASTAVOK_API_URL = os.getenv("LIGASTAVOK_API_URL", "")
 
 # ── Часовой пояс по умолчанию ────────────────────────────────────────────────
 DEFAULT_TZ_OFFSET = int(os.getenv("DEFAULT_TZ_OFFSET", "3"))

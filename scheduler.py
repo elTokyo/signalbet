@@ -14,8 +14,7 @@ from fonbet import (
     check_crookedness, build_match_url, format_bet_odds, has_relevant_odds,
     parse_bet_from_prediction,
 )
-import leon
-import betcity
+import bookmakers
 
 import asyncio
 
@@ -40,7 +39,6 @@ _tick_counter = 0
 _sent_prematch: set = set()
 _sent_live: set = set()
 _sent_crooked: set = set()
-_sent_leon: set = set()
 
 # Лок чтобы тики не накладывались друг на друга (тик может длиться >15 сек)
 _fonbet_lock = asyncio.Lock()
@@ -197,16 +195,25 @@ async def _fonbet_tick_inner(app: Application):
             # Помечаем в in-memory множествах ДО отправки (защита от дублей в процессе)
             _sent_live.add(pred.id)
             _sent_prematch.add(pred.id)
+            was_in_line = pred.fonbet_notified_prematch
             pred.fonbet_notified_live = True
+            # Матч уже не вернётся в линию — закрываем и этот флаг
             pred.fonbet_notified_prematch = True
             changed = True
+            # Если линии не было вообще (матч открыли сразу в лайве) — говорим об этом прямо
+            head = "🔴 Матч вышел в ЛАЙВ!" if was_in_line else "🔴 Матч открыт сразу в ЛАЙВЕ!"
             msg = (
-                f"🔴 Матч вышел в лайв!\n"
+                f"{head}\n"
                 f"{team1} — {team2}\n"
                 f"{odds_line}"
             )
+            if not was_in_line:
+                msg += f"\n\n📝 Прогноз:\n{pred.text}"
             await _broadcast(app, recipients_for("notify_match_out"), msg, url=match_url)
-            logger.info(f"[fonbet live] {team1} — {team2}")
+            logger.info(
+                f"[fonbet LIVE] {team1} — {team2} "
+                f"(признак: {event.get('live_reason')}, линия была: {was_in_line})"
+            )
 
         elif (not event["is_live"]) and not pred.fonbet_notified_prematch and pred.id not in _sent_prematch:
             # Есть ли релевантные коэффициенты под ставку прогноза?
@@ -219,95 +226,92 @@ async def _fonbet_tick_inner(app: Application):
                 pred.fonbet_notified_prematch = True
                 changed = True
                 msg = (
-                    f"📋 Матч вышел в прематч!\n"
+                    f"📋 Матч вышел в ЛИНИЮ!\n"
                     f"{team1} — {team2}\n"
                     f"{odds_line}\n\n"
                     f"📝 Прогноз:\n{pred.text}"
                 )
                 await _broadcast(app, recipients_for("notify_match_out"), msg, url=match_url)
-                logger.info(f"[fonbet prematch] {team1} — {team2}")
+                logger.info(f"[fonbet LINE] {team1} — {team2}")
             elif past_deadline:
                 _sent_prematch.add(pred.id)
                 pred.fonbet_notified_prematch = True
                 changed = True
                 msg = (
-                    f"📋 Матч вышел в прематч!\n"
+                    f"📋 Матч вышел в ЛИНИЮ!\n"
                     f"{team1} — {team2}\n"
                     f"(коэф. так и не появились)\n\n"
                     f"📝 Прогноз:\n{pred.text}"
                 )
                 await _broadcast(app, recipients_for("notify_match_out"), msg, url=match_url)
-                logger.info(f"[fonbet prematch no-odds timeout] {team1} — {team2}")
+                logger.info(f"[fonbet LINE no-odds timeout] {team1} — {team2}")
             else:
-                logger.info(f"[fonbet prematch waiting odds] {team1} — {team2}")
+                logger.info(f"[fonbet LINE waiting odds] {team1} — {team2}")
 
-        # ── Проверка на «кривой» матч (value) ──
+        # ── Кривой матч / андердог ──
         if not pred.crooked_notified and pred.id not in _sent_crooked:
             crooked = check_crookedness(pred.text, event)
             if crooked:
                 _sent_crooked.add(pred.id)
                 pred.crooked_notified = True
                 changed = True
-                status = "🔴 LIVE" if crooked["is_live"] else "📋 Прематч"
+                status = "🔴 ЛАЙВ" if crooked["is_live"] else "📋 ЛИНИЯ"
+
+                if crooked.get("kind") == "underdog":
+                    head, field = "🐶 АНДЕРДОГ!", "notify_underdog"
+                else:
+                    head, field = "💰 КРИВОЙ МАТЧ!", "notify_crooked"
+
                 msg = (
-                    f"💰 КРИВОЙ МАТЧ! ({status})\n"
+                    f"{head} ({status})\n"
                     f"{crooked['team1']} — {crooked['team2']}\n"
                     f"⚡ {crooked['reason']}\n"
                     f"{crooked['odds_info']}"
                 )
-                await _broadcast(app, recipients_for("notify_crooked"), msg, url=crooked.get("url"))
-                logger.info(f"[fonbet CROOKED] {team1} — {team2}: {crooked['reason']}")
+                await _broadcast(app, recipients_for(field), msg, url=crooked.get("url"))
+                logger.info(
+                    f"[fonbet {crooked.get('kind', 'crooked').upper()}] "
+                    f"{team1} — {team2}: {crooked['reason']}"
+                )
 
-        # ── Поиск победы на других БК когда на Фонбете нет чистой П1/П2 ──
-        # Каскад: Леон → если не нашёл → БетСити → (далее Лига Ставок)
-        if not pred.leon_notified and pred.id not in _sent_leon:
-            bet = parse_bet_from_prediction(pred.text)
-            if bet and bet["type"] == "win":
-                fonbet_win = event.get("odd_p1") if bet["team"] == 1 else event.get("odd_p2")
-                if fonbet_win is None:
-                    # У Фонбета НЕТ чистой победы нужной команды → ищем на других БК
-                    found = None
-                    bk_name = None
-
-                    # 1. Леон
-                    try:
-                        found = leon.find_win_odds(team1, team2, bet["team"],
-                                                   expected_utc=pred.match_time)
-                        if found:
-                            bk_name = "Леон"
-                    except Exception as e:
-                        logger.error(f"Leon lookup error: {e}")
-
-                    # 2. БетСити (если Леон не нашёл)
-                    if not found:
-                        try:
-                            found = betcity.find_win_odds(team1, team2, bet["team"],
-                                                          expected_utc=pred.match_time)
-                            if found:
-                                bk_name = "БетСити"
-                        except Exception as e:
-                            logger.error(f"BetCity lookup error: {e}")
-
-                    if found and found.get("odd"):
-                        _sent_leon.add(pred.id)
-                        pred.leon_notified = True
-                        changed = True
-                        msg = (
-                            f"🎯 Победа есть на {bk_name}!\n"
-                            f"{team1} — {team2}\n"
-                            f"На Фонбете нет чистой П{bet['team']}, "
-                            f"а на {bk_name} есть:\n"
-                            f"П{bet['team']} = {found['odd']:.2f}"
-                        )
-                        await _broadcast(app, recipients_for("notify_match_out"), msg)
-                        logger.info(
-                            f"[{bk_name} WIN] {team1} — {team2}: "
-                            f"П{bet['team']}={found['odd']}"
-                        )
+                # Вдогонку — ищем этот же матч и рынок на трёх других конторах.
+                # Запускаем в фоне: три HTTP-запроса не должны тормозить тик.
+                asyncio.create_task(
+                    _bookmakers_followup(app, pred, team1, team2, field)
+                )
 
     # Сохраняем флаги ОДИН раз в конце тика (батч) — снижает нагрузку на Gist API
     if changed:
         storage.save_predictions(predictions=predictions)
+
+
+async def _bookmakers_followup(app: Application, pred, team1: str, team2: str, field: str):
+    """
+    Догоняющее сообщение после «кривого»/«андердога»: есть ли этот матч и тот же
+    рынок на BetBoom / Winline / Лига Ставок.
+
+    Запросы синхронные (requests), поэтому уносим их в отдельный поток,
+    чтобы не блокировать event loop бота.
+    """
+    try:
+        bet = parse_bet_from_prediction(pred.text)
+        if not bet:
+            return
+        results = await asyncio.to_thread(
+            bookmakers.check_all, team1, team2, bet, pred.match_time
+        )
+        text = bookmakers.format_results(results)
+        if not text:
+            logger.info(f"[BK] {team1} — {team2}: ни одна контора матч не дала")
+            return
+        recipients = [
+            rid for rid in storage.get_all_recipient_chat_ids()
+            if getattr(storage.load_settings(rid), field, True)
+        ]
+        await _broadcast(app, recipients, f"{team1} — {team2}\n{text}")
+        logger.info(f"[BK] {team1} — {team2}: отправлен довесок по конторам")
+    except Exception as e:
+        logger.error(f"Bookmakers followup error: {e}")
 
 
 def _format_odds(odd_p1, odd_p2) -> str:

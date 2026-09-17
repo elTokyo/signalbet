@@ -164,6 +164,62 @@ async def _notify_added(preds: list, label: str):
         logger.error(f"Discord broadcast error: {e}")
 
 
+async def _send_tg(recipients: list[int], text: str):
+    """Отправка простого текста списку чатов через HTTP API Telegram."""
+    if not recipients:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            for chat_id in recipients:
+                try:
+                    await session.post(
+                        f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendMessage",
+                        json={"chat_id": chat_id, "text": text},
+                    )
+                except Exception as e:
+                    logger.error(f"TG send to {chat_id} failed: {e}")
+    except Exception as e:
+        logger.error(f"TG broadcast error: {e}")
+
+
+def _recipients_for(field: str) -> list[int]:
+    """Авторизованные пользователи, у которых включён нужный тумблер."""
+    return [
+        rid for rid in storage.get_all_recipient_chat_ids()
+        if getattr(storage.load_settings(rid), field, True)
+    ]
+
+
+# ── Голосовой канал: заход / выход ───────────────────────────────────────────
+
+# Время последних отправленных уведомлений (антиспам-кулдаун)
+_voice_last_sent: dict[str, float] = {"join": 0.0, "leave": 0.0}
+# Отложенная задача «вышел» — отменяется если человек вернулся за grace-период
+_voice_leave_task = None
+
+
+def _voice_enabled() -> bool:
+    return bool(config.DISCORD_VOICE_USER_ID and config.DISCORD_VOICE_CHANNEL_ID)
+
+
+async def _voice_notify(kind: str, member_name: str, channel_name: str):
+    """Шлёт уведомление о заходе/выходе с учётом кулдауна."""
+    now = asyncio.get_event_loop().time()
+    last = _voice_last_sent.get(kind, 0.0)
+    if last and (now - last) < config.VOICE_COOLDOWN_SEC:
+        logger.info(f"Voice {kind}: пропуск, кулдаун ({int(now - last)}с назад было)")
+        return
+    _voice_last_sent[kind] = now
+
+    if kind == "join":
+        text = f"🎧 {member_name} зашёл в голосовой «{channel_name}»"
+    else:
+        text = f"👋 {member_name} вышел из голосового «{channel_name}»"
+
+    await _send_tg(_recipients_for("notify_voice"), text)
+    logger.info(f"Voice {kind}: уведомление отправлено ({member_name})")
+
+
 def _pluralize_predictions(n: int) -> str:
     """Русское склонение 'прогноз/прогноза/прогнозов' по числу n."""
     n_abs = abs(n) % 100
@@ -269,6 +325,9 @@ def run_discord_listener():
 
     intents = discord.Intents.default()
     intents.message_content = True
+    # Нужен для on_voice_state_update (в Intents.default() уже включён,
+    # но фиксируем явно чтобы не отвалилось при смене defaults в discord.py)
+    intents.voice_states = True
 
     client = discord.Client(intents=intents)
 
@@ -303,7 +362,69 @@ def run_discord_listener():
             logger.info(f"Слушаю канал: #{ch.name}")
         else:
             logger.error(f"Канал {config.DISCORD_CHANNEL_ID} не найден")
+        if _voice_enabled():
+            vch = client.get_channel(config.DISCORD_VOICE_CHANNEL_ID)
+            logger.info(
+                f"Слежу за войсом: {vch.name if vch else config.DISCORD_VOICE_CHANNEL_ID}, "
+                f"юзер {config.DISCORD_VOICE_USER_ID}"
+            )
+            if not vch:
+                logger.warning(
+                    "Голосовой канал не найден — проверь DISCORD_VOICE_CHANNEL_ID "
+                    "и доступ бота к каналу (View Channel)"
+                )
+        else:
+            logger.info("Слежение за войсом выключено (нет DISCORD_VOICE_* переменных)")
         client.loop.create_task(periodic_recheck())
+
+    @client.event
+    async def on_voice_state_update(member, before, after):
+        """
+        Следим за одним конкретным пользователем в одном конкретном войсе.
+
+        Антиспам:
+          • уведомление о выходе откладывается на VOICE_LEAVE_GRACE_SEC —
+            если человек вернулся за это время, это реконнект и не шлём ничего;
+          • на каждый тип события (заход/выход) действует кулдаун
+            VOICE_COOLDOWN_SEC (по умолчанию 10 минут).
+        """
+        global _voice_leave_task
+
+        if not _voice_enabled():
+            return
+        if member.id != config.DISCORD_VOICE_USER_ID:
+            return
+
+        target = config.DISCORD_VOICE_CHANNEL_ID
+        was_in = before.channel is not None and before.channel.id == target
+        now_in = after.channel is not None and after.channel.id == target
+
+        if now_in == was_in:
+            return  # мут/деаф/стрим и прочие изменения внутри канала — игнор
+
+        name = getattr(member, "display_name", None) or str(member)
+
+        if now_in:
+            # Вернулся до истечения grace → это был реконнект: гасим «вышел»
+            if _voice_leave_task and not _voice_leave_task.done():
+                _voice_leave_task.cancel()
+                _voice_leave_task = None
+                logger.info("Voice: реконнект, уведомления не шлём")
+                return
+            await _voice_notify("join", name, after.channel.name)
+        else:
+            channel_name = before.channel.name
+
+            async def delayed_leave():
+                try:
+                    await asyncio.sleep(config.VOICE_LEAVE_GRACE_SEC)
+                    await _voice_notify("leave", name, channel_name)
+                except asyncio.CancelledError:
+                    pass
+
+            if _voice_leave_task and not _voice_leave_task.done():
+                _voice_leave_task.cancel()
+            _voice_leave_task = client.loop.create_task(delayed_leave())
 
     @client.event
     async def on_message(message: discord.Message):

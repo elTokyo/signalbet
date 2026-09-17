@@ -53,9 +53,11 @@ class UserSettings:
     timezone_offset: int = 3
     # Категории уведомлений (все включены по умолчанию)
     notify_reminders: bool = True        # напоминания за 30/5 мин
-    notify_match_out: bool = True        # выход матча в прематч/лайв (Фонбет)
+    notify_match_out: bool = True        # выход матча в линию/лайв (Фонбет)
     notify_crooked: bool = True          # кривые матчи (value)
+    notify_underdog: bool = True         # андердог (кэф на соперника 8+)
     notify_new_preds: bool = True        # новые прогнозы из Discord
+    notify_voice: bool = True            # заход/выход в голосовой Discord
     # Legacy-поле (раньше отвечало за прематч+лайв+кривые). Оставляем для миграции.
     fonbet_notifications: bool = True
 
@@ -66,7 +68,9 @@ class UserSettings:
             "notify_reminders": self.notify_reminders,
             "notify_match_out": self.notify_match_out,
             "notify_crooked": self.notify_crooked,
+            "notify_underdog": self.notify_underdog,
             "notify_new_preds": self.notify_new_preds,
+            "notify_voice": self.notify_voice,
             "fonbet_notifications": self.fonbet_notifications,
         }
 
@@ -80,6 +84,9 @@ class UserSettings:
             notify_reminders=d.get("notify_reminders", True),
             notify_match_out=d.get("notify_match_out", legacy_fonbet),
             notify_crooked=d.get("notify_crooked", legacy_fonbet),
+            # Новый тумблер: если его ещё нет в Gist — наследуем от «кривых матчей»
+            notify_underdog=d.get("notify_underdog", d.get("notify_crooked", legacy_fonbet)),
             notify_new_preds=d.get("notify_new_preds", True),
+            notify_voice=d.get("notify_voice", True),
             fonbet_notifications=legacy_fonbet,
         )

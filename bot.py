@@ -45,6 +45,11 @@ def main():
     logger.info(f"  GITHUB_TOKEN:    {'✅ задан' if config.GITHUB_TOKEN else '❌ НЕ ЗАДАН'}")
     logger.info(f"  GIST_ID:         {config.GIST_ID or '❌ НЕ ЗАДАН'}")
     logger.info(f"  DISCORD:         {'✅ настроен' if config.DISCORD_TOKEN else 'отключён'}")
+    voice_on = bool(config.DISCORD_VOICE_USER_ID and config.DISCORD_VOICE_CHANNEL_ID)
+    logger.info(
+        f"  ВОЙС-СЛЕЖКА:     "
+        f"{f'✅ юзер {config.DISCORD_VOICE_USER_ID} / канал {config.DISCORD_VOICE_CHANNEL_ID}' if voice_on else 'выключена'}"
+    )
     logger.info("=" * 50)
 
     if not config.ACCESS_PASSWORD:
@@ -74,6 +79,7 @@ def main():
     app.add_handler(CommandHandler("checkfonbet", handlers.cmd_checkfonbet))
     app.add_handler(CommandHandler("syncdiscord", handlers.cmd_syncdiscord))
     app.add_handler(CommandHandler("factors",     handlers.cmd_factors))
+    app.add_handler(CommandHandler("bk",          handlers.cmd_bk))
     app.add_handler(CommandHandler("broadcast", handlers.cmd_broadcast))
     app.add_handler(CommandHandler("cancel",    handlers.cmd_cancel))
 
