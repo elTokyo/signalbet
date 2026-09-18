@@ -209,15 +209,8 @@ async def _fonbet_tick_inner(app: Application):
                 # Матч уже не вернётся в линию — закрываем и этот флаг
                 pred.fonbet_notified_prematch = True
                 changed = True
-                head = "🔴 Матч вышел в лайв!"
                 odds_part = odds_line if has_odds else "(коэф. так и не появились)"
-                msg = (
-                    f"{head}\n"
-                    f"{team1} — {team2}\n"
-                    f"{odds_part}"
-                )
-                if not was_in_line:
-                    msg += f"\n\n📝 Прогноз:\n{pred.text}"
+                msg = _format_live_message(team1, team2, odds_part, pred.text)
                 await _broadcast(app, recipients_for("notify_match_out"), msg, url=match_url)
                 logger.info(
                     f"[fonbet LIVE{'' if has_odds else ' no-odds timeout'}] {team1} — {team2} "
@@ -341,6 +334,22 @@ async def _bookmakers_followup(app: Application, pred, team1: str, team2: str, f
         logger.info(f"[BK] {team1} — {team2}: отправлен довесок по конторам")
     except Exception as e:
         logger.error(f"Bookmakers followup error: {e}")
+
+
+def _format_live_message(team1: str, team2: str, odds_part: str, pred_text: str) -> str:
+    """
+    Уведомление «матч вышел в лайв». Прогноз дублируем ВСЕГДА.
+
+    Раньше прогноз добавлялся только если матч не проходил через «линию»
+    (там он уже был в сообщении) — из-за этого часть лайв-уведомлений
+    приходила без прогноза, и приходилось искать его в предыдущем сообщении.
+    """
+    return (
+        f"🔴 Матч вышел в лайв!\n"
+        f"{team1} — {team2}\n"
+        f"{odds_part}\n\n"
+        f"📝 Прогноз:\n{pred_text}"
+    )
 
 
 def _format_odds(odd_p1, odd_p2) -> str:

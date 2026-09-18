@@ -164,22 +164,34 @@ async def _notify_added(preds: list, label: str):
         logger.error(f"Discord broadcast error: {e}")
 
 
-async def _send_tg(recipients: list[int], text: str):
-    """Отправка простого текста списку чатов через HTTP API Telegram."""
+async def _send_tg(recipients: list[int], text: str) -> int:
+    """
+    Отправка простого текста списку чатов через HTTP API Telegram.
+    Возвращает число реально доставленных. Раньше HTTP-статус не проверялся:
+    если Telegram отвечал ошибкой (400/403/429), в логе всё равно писалось
+    «уведомление отправлено».
+    """
     if not recipients:
-        return
+        return 0
+    delivered = 0
     try:
         async with aiohttp.ClientSession() as session:
             for chat_id in recipients:
                 try:
-                    await session.post(
+                    async with session.post(
                         f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendMessage",
                         json={"chat_id": chat_id, "text": text},
-                    )
+                    ) as resp:
+                        if resp.status == 200:
+                            delivered += 1
+                        else:
+                            body = (await resp.text())[:200]
+                            logger.error(f"TG send to {chat_id}: HTTP {resp.status} {body}")
                 except Exception as e:
                     logger.error(f"TG send to {chat_id} failed: {e}")
     except Exception as e:
         logger.error(f"TG broadcast error: {e}")
+    return delivered
 
 
 def _recipients_for(field: str) -> list[int]:
@@ -196,19 +208,27 @@ def _recipients_for(field: str) -> list[int]:
 _voice_last_sent: dict[str, float] = {"join": 0.0, "leave": 0.0}
 # Отложенная задача «вышел» — отменяется если человек вернулся за grace-период
 _voice_leave_task = None
+# Для диагностики (/voice): последнее событие цели и время последних отправок
+_voice_diag: dict = {"last_event": None, "last_event_at": None, "sent_at": {}}
 
 
 def _voice_enabled() -> bool:
     return bool(config.DISCORD_VOICE_USER_ID and config.DISCORD_VOICE_CHANNEL_ID)
 
 
+def _fmt_utc(dt) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC") if dt else "—"
+
+
 async def _voice_notify(kind: str, member_name: str, channel_name: str):
     """Шлёт уведомление о заходе/выходе с учётом кулдауна."""
     now = asyncio.get_event_loop().time()
-    last = _voice_last_sent.get(kind, 0.0)
-    if last and (now - last) < config.VOICE_COOLDOWN_SEC:
-        logger.info(f"Voice {kind}: пропуск, кулдаун ({int(now - last)}с назад было)")
+    prev = _voice_last_sent.get(kind, 0.0)
+    if prev and (now - prev) < config.VOICE_COOLDOWN_SEC:
+        logger.info(f"Voice {kind}: пропуск, кулдаун ({int(now - prev)}с назад было)")
         return
+    # Занимаем слот сразу (защита от двойной отправки при гонке событий),
+    # но откатываем, если не дошло вообще никому.
     _voice_last_sent[kind] = now
 
     if kind == "join":
@@ -216,8 +236,79 @@ async def _voice_notify(kind: str, member_name: str, channel_name: str):
     else:
         text = f"👋 {member_name} вышел из голосового «{channel_name}»"
 
-    await _send_tg(_recipients_for("notify_voice"), text)
-    logger.info(f"Voice {kind}: уведомление отправлено ({member_name})")
+    # storage ходит в Gist синхронным requests — уносим из event loop Discord,
+    # чтобы не задерживать heartbeat гейтвея.
+    recipients = await asyncio.to_thread(_recipients_for, "notify_voice")
+    if not recipients:
+        _voice_last_sent[kind] = prev
+        logger.warning(
+            f"Voice {kind}: некому слать — нет авторизованных или у всех выключен "
+            f"«🎧 Заход в войс Discord» в /settings"
+        )
+        return
+
+    delivered = await _send_tg(recipients, text)
+    if delivered:
+        _voice_diag["sent_at"][kind] = datetime.now(timezone.utc)
+        logger.info(f"Voice {kind}: отправлено {delivered}/{len(recipients)} ({member_name})")
+    else:
+        _voice_last_sent[kind] = prev
+        logger.error(f"Voice {kind}: Telegram не принял ни одного сообщения ({len(recipients)} получателей)")
+
+
+def _find_target_channel():
+    """Где цель сидит СЕЙЧАС среди каналов, которые видит бот (или None)."""
+    if _client_ref is None:
+        return None
+    for g in _client_ref.guilds:
+        for vc in g.voice_channels:
+            if config.DISCORD_VOICE_USER_ID in vc.voice_states:
+                return vc
+    return None
+
+
+def get_voice_status() -> str:
+    """Текст для /voice: включено ли слежение и что бот реально видит."""
+    lines = ["🎧 Слежение за войсом Discord", ""]
+    if not _voice_enabled():
+        lines.append("Выключено: не заданы DISCORD_VOICE_USER_ID и/или DISCORD_VOICE_CHANNEL_ID.")
+        return "\n".join(lines)
+
+    lines.append(f"Цель (user): {config.DISCORD_VOICE_USER_ID}")
+    lines.append(f"Канал (id):  {config.DISCORD_VOICE_CHANNEL_ID}")
+    if _client_ref is None or _client_ref.is_closed():
+        lines.append("\n❌ Discord-клиент не запущен / соединение закрыто.")
+        return "\n".join(lines)
+
+    vch = _client_ref.get_channel(config.DISCORD_VOICE_CHANNEL_ID)
+    if vch is None:
+        lines.append(
+            "\n❌ Бот НЕ видит этот канал: неверный ID или у бота нет права View Channel "
+            "на голосовом канале. Пока так — события захода/выхода до бота не доходят."
+        )
+    else:
+        inside = config.DISCORD_VOICE_USER_ID in vch.voice_states
+        lines.append(f"\n✅ Канал найден: «{vch.name}», сейчас внутри: {len(vch.voice_states)}")
+        lines.append(f"Цель в этом канале: {'ДА' if inside else 'нет'}")
+        if not inside:
+            other = _find_target_channel()
+            if other is not None:
+                lines.append(f"⚠️ Но цель сидит в другом канале: «{other.name}» (id {other.id})")
+            else:
+                lines.append("Ни в одном видимом боту войсе цели нет.")
+
+    ev, ev_at = _voice_diag["last_event"], _voice_diag["last_event_at"]
+    lines.append(f"\nПоследнее событие цели: {ev or 'не было с момента запуска'} ({_fmt_utc(ev_at)})")
+    sent = _voice_diag["sent_at"]
+    lines.append(f"Последнее «зашёл»: {_fmt_utc(sent.get('join'))}")
+    lines.append(f"Последнее «вышел»: {_fmt_utc(sent.get('leave'))}")
+
+    try:
+        n = len(_recipients_for("notify_voice"))
+        lines.append(f"Получателей с включённым тумблером: {n}")
+    except Exception as e:
+        lines.append(f"Получатели: ошибка ({e})")
+    return "\n".join(lines)
 
 
 def _pluralize_predictions(n: int) -> str:
@@ -373,6 +464,14 @@ def run_discord_listener():
                     "Голосовой канал не найден — проверь DISCORD_VOICE_CHANNEL_ID "
                     "и доступ бота к каналу (View Channel)"
                 )
+            else:
+                # Если цель уже сидела в войсе к моменту старта бота (например,
+                # во время редеплоя) — события «зашёл» не будет вообще, это норма.
+                inside = config.DISCORD_VOICE_USER_ID in vch.voice_states
+                logger.info(
+                    f"Войс «{vch.name}»: внутри {len(vch.voice_states)}, "
+                    f"цель {'УЖЕ ВНУТРИ (уведомления о заходе не будет)' if inside else 'не в канале'}"
+                )
         else:
             logger.info("Слежение за войсом выключено (нет DISCORD_VOICE_* переменных)")
         client.loop.create_task(periodic_recheck())
@@ -398,6 +497,18 @@ def run_discord_listener():
         target = config.DISCORD_VOICE_CHANNEL_ID
         was_in = before.channel is not None and before.channel.id == target
         now_in = after.channel is not None and after.channel.id == target
+
+        # Каждое перемещение цели между каналами пишем в лог — иначе при «не пришло
+        # уведомление» не видно, дошло ли событие вообще и в какой канал он заходил.
+        b_id = before.channel.id if before.channel else None
+        a_id = after.channel.id if after.channel else None
+        if b_id != a_id:
+            _voice_diag["last_event"] = f"{b_id} → {a_id}"
+            _voice_diag["last_event_at"] = datetime.now(timezone.utc)
+            logger.info(
+                f"Voice: цель {b_id} → {a_id} (следим за каналом {target}"
+                f"{'' if (was_in or now_in) else ', это ДРУГОЙ канал — игнор'})"
+            )
 
         if now_in == was_in:
             return  # мут/деаф/стрим и прочие изменения внутри канала — игнор

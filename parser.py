@@ -36,6 +36,27 @@ _WORD_GROUP = r'[A-ZА-Я0-9\(][\w\-\(\)]*(?:\s[A-ZА-Я0-9\(][\w\-\(\)]*)*'
 _HEADER_SEGMENT_SEP = r'(?:\.\s+|\s-\s)'   # конец сегмента: ". " или " - "
 _NEW_FORMAT_HEADER = r'(?:' + _WORD_GROUP + _HEADER_SEGMENT_SEP + r'){1,3}'  # Страна.[ Лига.][ - Подлига.]
 
+# «Мягкий» заголовок — ТОЛЬКО для начала строки (для поиска внутри строки он
+# слишком жадный). Строгий вариант выше требует, чтобы КАЖДОЕ слово сегмента
+# начиналось с заглавной, поэтому строки вроде
+#   "South American games. Women. Argentina 21-00"     (строчное «games»)
+#   "Bosnia and Herzegovina. Premier League 18-00"     (строчное «and»)
+#   "International. Club friendly games 15-00"
+# не считались заголовком: строка приклеивалась к предыдущему прогнозу, и два
+# матча превращались в один (второй терялся, а у первого «команда 2» становилась
+# мусором и не находилась на Фонбете).
+# Чтобы не ловить обычные фразы с точкой (ставка/комментарий), мягкий заголовок
+# принимается только если в строке ДО тире команд есть время HH-MM — либо время
+# идёт отдельной строкой сразу следом (см. _is_new_format_header).
+_LOOSE_WORD_GROUP = r"[A-ZА-Я0-9\(][\w\-\(\)'’]*(?:\s[\w\-\(\)'’]+)*"
+_NEW_FORMAT_LOOSE_HEAD = re.compile(
+    r'^(?:' + _LOOSE_WORD_GROUP + _HEADER_SEGMENT_SEP + r'){1,3}'
+)
+_NEW_FORMAT_LOOSE_WITH_TIME = re.compile(
+    _NEW_FORMAT_LOOSE_HEAD.pattern + r'(?=[^—–]*?(?<![\d:\-])\d{1,2}[-:]\d{2}\b)'
+)
+_TIME_ONLY_LINE = re.compile(r'^\d{1,2}[-:]\d{2}$')
+
 
 def parse_predictions(text: str, tz_offset: int = 3, source: str = "manual") -> list[Prediction]:
     """
@@ -98,6 +119,25 @@ _OLD_FORMAT_LINE_START = re.compile(r'(?i)^(?:футбол|soccer)[\.\s]')
 # строка, новый прогноз) от "Kazincbarcikai SC" (конец строки с командами
 # предыдущего прогноза, тоже с заглавных букв, но НЕ в начале своей строки).
 _NEW_FORMAT_LINE_START = re.compile(r'^' + _NEW_FORMAT_HEADER)
+
+
+def _is_new_format_header(chunk: str, next_line: Optional[str] = None) -> bool:
+    """
+    Начинается ли chunk (начало строки) новым заголовком прогноза.
+    1. Строгий заголовок — все слова сегментов с заглавной (как раньше).
+    2. Мягкий — допускает строчные слова внутри сегмента, но только если в
+       строке есть время ДО тире команд.
+    3. Мягкий без времени в строке — если время лежит отдельной строкой следом
+       (\"...Women\" / \"14-30\" / \"Team A — Team B\").
+    """
+    if _NEW_FORMAT_LINE_START.match(chunk):
+        return True
+    if _NEW_FORMAT_LOOSE_WITH_TIME.match(chunk):
+        return True
+    if next_line and _TIME_ONLY_LINE.match(next_line.strip()) \
+            and _NEW_FORMAT_LOOSE_HEAD.match(chunk):
+        return True
+    return False
 
 
 _OLD_FORMAT_INLINE_TRIGGER = re.compile(r'(?i)(?<=\s)(?:футбол|soccer)[\.\s]')
@@ -165,16 +205,22 @@ def _split_new_format(lines: list[str]) -> list[str]:
     """
     blocks = []
     current = []
-    for raw_line in lines:
+    for idx, raw_line in enumerate(lines):
         # Схлопываем внутристрочные пробелы/табы (в Discord между лигой и
         # временем часто стоит несколько пробелов/таб — раньше это убирал
         # общий re.sub на всём тексте, теперь делаем это здесь, построчно).
         line = re.sub(r'[ \t]+', ' ', raw_line).strip()
         if not line:
             continue
+        next_line = lines[idx + 1] if idx + 1 < len(lines) else None
 
-        for chunk in _split_line_on_closed_headers(line):
-            is_header_chunk = bool(_NEW_FORMAT_LINE_START.match(chunk))
+        chunks = _split_line_on_closed_headers(line)
+        for ci, chunk in enumerate(chunks):
+            # «Время следом отдельной строкой» имеет смысл только для последнего
+            # куска строки — у остальных следом идёт другой кусок той же строки.
+            is_header_chunk = _is_new_format_header(
+                chunk, next_line if ci == len(chunks) - 1 else None
+            )
 
             if is_header_chunk and _block_is_closed(current):
                 if current:

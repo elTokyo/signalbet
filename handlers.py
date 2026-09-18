@@ -601,6 +601,19 @@ async def cmd_syncdiscord(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @require_admin
+async def cmd_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Диагностика слежения за голосовым каналом Discord."""
+    try:
+        import discord_listener
+        text = discord_listener.get_voice_status()
+    except Exception as e:
+        logger.exception(f"/voice error: {e}")
+        text = f"❌ Ошибка: {e}"
+    # Без parse_mode: в названиях каналов бывают _ и *, Markdown на них ломается
+    await update.message.reply_text(text)
+
+
+@require_admin
 async def cmd_factors(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     Диагностика: дампит ВСЕ факторы (рынки) первого матча из листа прогнозов.

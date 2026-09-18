@@ -1,0 +1,574 @@
+diff --git a/README.md b/README.md
+index e79e295..597d034 100644
+--- a/README.md
++++ b/README.md
+@@ -71,6 +71,7 @@ Telegram-бот для футбольных прогнозов: напомина
+ - `/debug` — диагностика конфигурации
+ - `/checkfonbet` — матчинг прогнозов с Фонбетом (видно статус ЛИНИЯ/ЛАЙВ и признак)
+ - `/bk [N]` — проверить прогноз №N на BetBoom / Winline / Лиге Ставок
++- `/voice` — диагностика слежения за войсом Discord (видит ли бот канал, где сейчас цель, когда было последнее событие)
+ - `/cancel` — отмена текущего ввода
+ 
+ ---
+@@ -144,6 +145,7 @@ Telegram-бот для футбольных прогнозов: напомина
+ - `📋 Матч вышел в ЛИНИЮ!` — появился в прематче
+ - `🔴 Матч вышел в ЛАЙВ!` — начался (после линии)
+ - `🔴 Матч открыт сразу в ЛАЙВЕ!` — линии не было вообще, уведомление одно
++- Во всех «лайв»-уведомлениях дублируется `📝 Прогноз` — даже если до этого приходило уведомление о линии
+ 
+ ### Кривой матч и андердог
+ 
+@@ -180,6 +182,8 @@ python bk_probe.py https://новый/url  # проверить конкретн
+ - Кулдаун 10 минут на каждый тип события
+ - Тумблер `🎧 Заход в войс Discord` в `/settings`
+ - Нужен intent `voice_states` (входит в defaults, включается кодом) и доступ бота к каналу
++- Если цель уже сидела в войсе, когда бот стартовал (например, во время редеплоя), события «зашёл» не будет — так устроен Discord. Дальше «вышел» сработает как обычно
++- Не пришло уведомление → `/voice`: покажет, видит ли бот канал и не сидит ли цель в другом войсе
+ 
+ ---
+ 
+diff --git a/bot.py b/bot.py
+index f82bcfe..d071997 100644
+--- a/bot.py
++++ b/bot.py
+@@ -14,6 +14,12 @@ logging.basicConfig(
+ )
+ logger = logging.getLogger(__name__)
+ 
++# httpx на INFO пишет строку на каждый getUpdates (раз в ~10 сек) — она забивает
++# логи Railway (в выгрузке на 1000 строк остаётся 99% шума) и содержит BOT_TOKEN
++# прямо в URL. Оставляем только предупреждения/ошибки.
++logging.getLogger("httpx").setLevel(logging.WARNING)
++logging.getLogger("httpcore").setLevel(logging.WARNING)
++
+ 
+ def start_discord_in_background():
+     if not config.DISCORD_TOKEN:
+@@ -78,6 +84,7 @@ def main():
+     app.add_handler(CommandHandler("debug",     handlers.cmd_debug))
+     app.add_handler(CommandHandler("checkfonbet", handlers.cmd_checkfonbet))
+     app.add_handler(CommandHandler("syncdiscord", handlers.cmd_syncdiscord))
++    app.add_handler(CommandHandler("voice",       handlers.cmd_voice))
+     app.add_handler(CommandHandler("factors",     handlers.cmd_factors))
+     app.add_handler(CommandHandler("bk",          handlers.cmd_bk))
+     app.add_handler(CommandHandler("broadcast", handlers.cmd_broadcast))
+diff --git a/discord_listener.py b/discord_listener.py
+index dda5809..71609e1 100644
+--- a/discord_listener.py
++++ b/discord_listener.py
+@@ -164,22 +164,34 @@ async def _notify_added(preds: list, label: str):
+         logger.error(f"Discord broadcast error: {e}")
+ 
+ 
+-async def _send_tg(recipients: list[int], text: str):
+-    """Отправка простого текста списку чатов через HTTP API Telegram."""
++async def _send_tg(recipients: list[int], text: str) -> int:
++    """
++    Отправка простого текста списку чатов через HTTP API Telegram.
++    Возвращает число реально доставленных. Раньше HTTP-статус не проверялся:
++    если Telegram отвечал ошибкой (400/403/429), в логе всё равно писалось
++    «уведомление отправлено».
++    """
+     if not recipients:
+-        return
++        return 0
++    delivered = 0
+     try:
+         async with aiohttp.ClientSession() as session:
+             for chat_id in recipients:
+                 try:
+-                    await session.post(
++                    async with session.post(
+                         f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendMessage",
+                         json={"chat_id": chat_id, "text": text},
+-                    )
++                    ) as resp:
++                        if resp.status == 200:
++                            delivered += 1
++                        else:
++                            body = (await resp.text())[:200]
++                            logger.error(f"TG send to {chat_id}: HTTP {resp.status} {body}")
+                 except Exception as e:
+                     logger.error(f"TG send to {chat_id} failed: {e}")
+     except Exception as e:
+         logger.error(f"TG broadcast error: {e}")
++    return delivered
+ 
+ 
+ def _recipients_for(field: str) -> list[int]:
+@@ -196,19 +208,27 @@ def _recipients_for(field: str) -> list[int]:
+ _voice_last_sent: dict[str, float] = {"join": 0.0, "leave": 0.0}
+ # Отложенная задача «вышел» — отменяется если человек вернулся за grace-период
+ _voice_leave_task = None
++# Для диагностики (/voice): последнее событие цели и время последних отправок
++_voice_diag: dict = {"last_event": None, "last_event_at": None, "sent_at": {}}
+ 
+ 
+ def _voice_enabled() -> bool:
+     return bool(config.DISCORD_VOICE_USER_ID and config.DISCORD_VOICE_CHANNEL_ID)
+ 
+ 
++def _fmt_utc(dt) -> str:
++    return dt.strftime("%Y-%m-%d %H:%M:%S UTC") if dt else "—"
++
++
+ async def _voice_notify(kind: str, member_name: str, channel_name: str):
+     """Шлёт уведомление о заходе/выходе с учётом кулдауна."""
+     now = asyncio.get_event_loop().time()
+-    last = _voice_last_sent.get(kind, 0.0)
+-    if last and (now - last) < config.VOICE_COOLDOWN_SEC:
+-        logger.info(f"Voice {kind}: пропуск, кулдаун ({int(now - last)}с назад было)")
++    prev = _voice_last_sent.get(kind, 0.0)
++    if prev and (now - prev) < config.VOICE_COOLDOWN_SEC:
++        logger.info(f"Voice {kind}: пропуск, кулдаун ({int(now - prev)}с назад было)")
+         return
++    # Занимаем слот сразу (защита от двойной отправки при гонке событий),
++    # но откатываем, если не дошло вообще никому.
+     _voice_last_sent[kind] = now
+ 
+     if kind == "join":
+@@ -216,8 +236,79 @@ async def _voice_notify(kind: str, member_name: str, channel_name: str):
+     else:
+         text = f"👋 {member_name} вышел из голосового «{channel_name}»"
+ 
+-    await _send_tg(_recipients_for("notify_voice"), text)
+-    logger.info(f"Voice {kind}: уведомление отправлено ({member_name})")
++    # storage ходит в Gist синхронным requests — уносим из event loop Discord,
++    # чтобы не задерживать heartbeat гейтвея.
++    recipients = await asyncio.to_thread(_recipients_for, "notify_voice")
++    if not recipients:
++        _voice_last_sent[kind] = prev
++        logger.warning(
++            f"Voice {kind}: некому слать — нет авторизованных или у всех выключен "
++            f"«🎧 Заход в войс Discord» в /settings"
++        )
++        return
++
++    delivered = await _send_tg(recipients, text)
++    if delivered:
++        _voice_diag["sent_at"][kind] = datetime.now(timezone.utc)
++        logger.info(f"Voice {kind}: отправлено {delivered}/{len(recipients)} ({member_name})")
++    else:
++        _voice_last_sent[kind] = prev
++        logger.error(f"Voice {kind}: Telegram не принял ни одного сообщения ({len(recipients)} получателей)")
++
++
++def _find_target_channel():
++    """Где цель сидит СЕЙЧАС среди каналов, которые видит бот (или None)."""
++    if _client_ref is None:
++        return None
++    for g in _client_ref.guilds:
++        for vc in g.voice_channels:
++            if config.DISCORD_VOICE_USER_ID in vc.voice_states:
++                return vc
++    return None
++
++
++def get_voice_status() -> str:
++    """Текст для /voice: включено ли слежение и что бот реально видит."""
++    lines = ["🎧 Слежение за войсом Discord", ""]
++    if not _voice_enabled():
++        lines.append("Выключено: не заданы DISCORD_VOICE_USER_ID и/или DISCORD_VOICE_CHANNEL_ID.")
++        return "\n".join(lines)
++
++    lines.append(f"Цель (user): {config.DISCORD_VOICE_USER_ID}")
++    lines.append(f"Канал (id):  {config.DISCORD_VOICE_CHANNEL_ID}")
++    if _client_ref is None or _client_ref.is_closed():
++        lines.append("\n❌ Discord-клиент не запущен / соединение закрыто.")
++        return "\n".join(lines)
++
++    vch = _client_ref.get_channel(config.DISCORD_VOICE_CHANNEL_ID)
++    if vch is None:
++        lines.append(
++            "\n❌ Бот НЕ видит этот канал: неверный ID или у бота нет права View Channel "
++            "на голосовом канале. Пока так — события захода/выхода до бота не доходят."
++        )
++    else:
++        inside = config.DISCORD_VOICE_USER_ID in vch.voice_states
++        lines.append(f"\n✅ Канал найден: «{vch.name}», сейчас внутри: {len(vch.voice_states)}")
++        lines.append(f"Цель в этом канале: {'ДА' if inside else 'нет'}")
++        if not inside:
++            other = _find_target_channel()
++            if other is not None:
++                lines.append(f"⚠️ Но цель сидит в другом канале: «{other.name}» (id {other.id})")
++            else:
++                lines.append("Ни в одном видимом боту войсе цели нет.")
++
++    ev, ev_at = _voice_diag["last_event"], _voice_diag["last_event_at"]
++    lines.append(f"\nПоследнее событие цели: {ev or 'не было с момента запуска'} ({_fmt_utc(ev_at)})")
++    sent = _voice_diag["sent_at"]
++    lines.append(f"Последнее «зашёл»: {_fmt_utc(sent.get('join'))}")
++    lines.append(f"Последнее «вышел»: {_fmt_utc(sent.get('leave'))}")
++
++    try:
++        n = len(_recipients_for("notify_voice"))
++        lines.append(f"Получателей с включённым тумблером: {n}")
++    except Exception as e:
++        lines.append(f"Получатели: ошибка ({e})")
++    return "\n".join(lines)
+ 
+ 
+ def _pluralize_predictions(n: int) -> str:
+@@ -373,6 +464,14 @@ def run_discord_listener():
+                     "Голосовой канал не найден — проверь DISCORD_VOICE_CHANNEL_ID "
+                     "и доступ бота к каналу (View Channel)"
+                 )
++            else:
++                # Если цель уже сидела в войсе к моменту старта бота (например,
++                # во время редеплоя) — события «зашёл» не будет вообще, это норма.
++                inside = config.DISCORD_VOICE_USER_ID in vch.voice_states
++                logger.info(
++                    f"Войс «{vch.name}»: внутри {len(vch.voice_states)}, "
++                    f"цель {'УЖЕ ВНУТРИ (уведомления о заходе не будет)' if inside else 'не в канале'}"
++                )
+         else:
+             logger.info("Слежение за войсом выключено (нет DISCORD_VOICE_* переменных)")
+         client.loop.create_task(periodic_recheck())
+@@ -399,6 +498,18 @@ def run_discord_listener():
+         was_in = before.channel is not None and before.channel.id == target
+         now_in = after.channel is not None and after.channel.id == target
+ 
++        # Каждое перемещение цели между каналами пишем в лог — иначе при «не пришло
++        # уведомление» не видно, дошло ли событие вообще и в какой канал он заходил.
++        b_id = before.channel.id if before.channel else None
++        a_id = after.channel.id if after.channel else None
++        if b_id != a_id:
++            _voice_diag["last_event"] = f"{b_id} → {a_id}"
++            _voice_diag["last_event_at"] = datetime.now(timezone.utc)
++            logger.info(
++                f"Voice: цель {b_id} → {a_id} (следим за каналом {target}"
++                f"{'' if (was_in or now_in) else ', это ДРУГОЙ канал — игнор'})"
++            )
++
+         if now_in == was_in:
+             return  # мут/деаф/стрим и прочие изменения внутри канала — игнор
+ 
+diff --git a/handlers.py b/handlers.py
+index 60265ef..f750c58 100644
+--- a/handlers.py
++++ b/handlers.py
+@@ -600,6 +600,19 @@ async def cmd_syncdiscord(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+         await msg.edit_text(f"❌ {info}")
+ 
+ 
++@require_admin
++async def cmd_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    """Диагностика слежения за голосовым каналом Discord."""
++    try:
++        import discord_listener
++        text = discord_listener.get_voice_status()
++    except Exception as e:
++        logger.exception(f"/voice error: {e}")
++        text = f"❌ Ошибка: {e}"
++    # Без parse_mode: в названиях каналов бывают _ и *, Markdown на них ломается
++    await update.message.reply_text(text)
++
++
+ @require_admin
+ async def cmd_factors(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+     """
+diff --git a/parser.py b/parser.py
+index 9dcb246..77d1e6b 100644
+--- a/parser.py
++++ b/parser.py
+@@ -36,6 +36,27 @@ _WORD_GROUP = r'[A-ZА-Я0-9\(][\w\-\(\)]*(?:\s[A-ZА-Я0-9\(][\w\-\(\)]*)*'
+ _HEADER_SEGMENT_SEP = r'(?:\.\s+|\s-\s)'   # конец сегмента: ". " или " - "
+ _NEW_FORMAT_HEADER = r'(?:' + _WORD_GROUP + _HEADER_SEGMENT_SEP + r'){1,3}'  # Страна.[ Лига.][ - Подлига.]
+ 
++# «Мягкий» заголовок — ТОЛЬКО для начала строки (для поиска внутри строки он
++# слишком жадный). Строгий вариант выше требует, чтобы КАЖДОЕ слово сегмента
++# начиналось с заглавной, поэтому строки вроде
++#   "South American games. Women. Argentina 21-00"     (строчное «games»)
++#   "Bosnia and Herzegovina. Premier League 18-00"     (строчное «and»)
++#   "International. Club friendly games 15-00"
++# не считались заголовком: строка приклеивалась к предыдущему прогнозу, и два
++# матча превращались в один (второй терялся, а у первого «команда 2» становилась
++# мусором и не находилась на Фонбете).
++# Чтобы не ловить обычные фразы с точкой (ставка/комментарий), мягкий заголовок
++# принимается только если в строке ДО тире команд есть время HH-MM — либо время
++# идёт отдельной строкой сразу следом (см. _is_new_format_header).
++_LOOSE_WORD_GROUP = r"[A-ZА-Я0-9\(][\w\-\(\)'’]*(?:\s[\w\-\(\)'’]+)*"
++_NEW_FORMAT_LOOSE_HEAD = re.compile(
++    r'^(?:' + _LOOSE_WORD_GROUP + _HEADER_SEGMENT_SEP + r'){1,3}'
++)
++_NEW_FORMAT_LOOSE_WITH_TIME = re.compile(
++    _NEW_FORMAT_LOOSE_HEAD.pattern + r'(?=[^—–]*?(?<![\d:\-])\d{1,2}[-:]\d{2}\b)'
++)
++_TIME_ONLY_LINE = re.compile(r'^\d{1,2}[-:]\d{2}$')
++
+ 
+ def parse_predictions(text: str, tz_offset: int = 3, source: str = "manual") -> list[Prediction]:
+     """
+@@ -100,6 +121,25 @@ _OLD_FORMAT_LINE_START = re.compile(r'(?i)^(?:футбол|soccer)[\.\s]')
+ _NEW_FORMAT_LINE_START = re.compile(r'^' + _NEW_FORMAT_HEADER)
+ 
+ 
++def _is_new_format_header(chunk: str, next_line: Optional[str] = None) -> bool:
++    """
++    Начинается ли chunk (начало строки) новым заголовком прогноза.
++    1. Строгий заголовок — все слова сегментов с заглавной (как раньше).
++    2. Мягкий — допускает строчные слова внутри сегмента, но только если в
++       строке есть время ДО тире команд.
++    3. Мягкий без времени в строке — если время лежит отдельной строкой следом
++       (\"...Women\" / \"14-30\" / \"Team A — Team B\").
++    """
++    if _NEW_FORMAT_LINE_START.match(chunk):
++        return True
++    if _NEW_FORMAT_LOOSE_WITH_TIME.match(chunk):
++        return True
++    if next_line and _TIME_ONLY_LINE.match(next_line.strip()) \
++            and _NEW_FORMAT_LOOSE_HEAD.match(chunk):
++        return True
++    return False
++
++
+ _OLD_FORMAT_INLINE_TRIGGER = re.compile(r'(?i)(?<=\s)(?:футбол|soccer)[\.\s]')
+ 
+ 
+@@ -165,16 +205,22 @@ def _split_new_format(lines: list[str]) -> list[str]:
+     """
+     blocks = []
+     current = []
+-    for raw_line in lines:
++    for idx, raw_line in enumerate(lines):
+         # Схлопываем внутристрочные пробелы/табы (в Discord между лигой и
+         # временем часто стоит несколько пробелов/таб — раньше это убирал
+         # общий re.sub на всём тексте, теперь делаем это здесь, построчно).
+         line = re.sub(r'[ \t]+', ' ', raw_line).strip()
+         if not line:
+             continue
+-
+-        for chunk in _split_line_on_closed_headers(line):
+-            is_header_chunk = bool(_NEW_FORMAT_LINE_START.match(chunk))
++        next_line = lines[idx + 1] if idx + 1 < len(lines) else None
++
++        chunks = _split_line_on_closed_headers(line)
++        for ci, chunk in enumerate(chunks):
++            # «Время следом отдельной строкой» имеет смысл только для последнего
++            # куска строки — у остальных следом идёт другой кусок той же строки.
++            is_header_chunk = _is_new_format_header(
++                chunk, next_line if ci == len(chunks) - 1 else None
++            )
+ 
+             if is_header_chunk and _block_is_closed(current):
+                 if current:
+diff --git a/scheduler.py b/scheduler.py
+index 4204021..952a169 100644
+--- a/scheduler.py
++++ b/scheduler.py
+@@ -209,15 +209,8 @@ async def _fonbet_tick_inner(app: Application):
+                 # Матч уже не вернётся в линию — закрываем и этот флаг
+                 pred.fonbet_notified_prematch = True
+                 changed = True
+-                head = "🔴 Матч вышел в лайв!"
+                 odds_part = odds_line if has_odds else "(коэф. так и не появились)"
+-                msg = (
+-                    f"{head}\n"
+-                    f"{team1} — {team2}\n"
+-                    f"{odds_part}"
+-                )
+-                if not was_in_line:
+-                    msg += f"\n\n📝 Прогноз:\n{pred.text}"
++                msg = _format_live_message(team1, team2, odds_part, pred.text)
+                 await _broadcast(app, recipients_for("notify_match_out"), msg, url=match_url)
+                 logger.info(
+                     f"[fonbet LIVE{'' if has_odds else ' no-odds timeout'}] {team1} — {team2} "
+@@ -343,6 +336,22 @@ async def _bookmakers_followup(app: Application, pred, team1: str, team2: str, f
+         logger.error(f"Bookmakers followup error: {e}")
+ 
+ 
++def _format_live_message(team1: str, team2: str, odds_part: str, pred_text: str) -> str:
++    """
++    Уведомление «матч вышел в лайв». Прогноз дублируем ВСЕГДА.
++
++    Раньше прогноз добавлялся только если матч не проходил через «линию»
++    (там он уже был в сообщении) — из-за этого часть лайв-уведомлений
++    приходила без прогноза, и приходилось искать его в предыдущем сообщении.
++    """
++    return (
++        f"🔴 Матч вышел в лайв!\n"
++        f"{team1} — {team2}\n"
++        f"{odds_part}\n\n"
++        f"📝 Прогноз:\n{pred_text}"
++    )
++
++
+ def _format_odds(odd_p1, odd_p2) -> str:
+     """Форматирует строку с коэффициентами."""
+     if odd_p1 is None and odd_p2 is None:
+diff --git a/test_bot.py b/test_bot.py
+index c8b00fe..71782af 100644
+--- a/test_bot.py
++++ b/test_bot.py
+@@ -49,6 +49,8 @@ parser = _load('parser')
+ fonbet = _load('fonbet')
+ discord_listener = _load('discord_listener')
+ bookmakers = _load('bookmakers')
++sys.modules.setdefault('auth', MagicMock())   # auth.py для тестов не нужен
++scheduler = _load('scheduler')
+ 
+ # Счётчики
+ _passed = 0
+@@ -247,6 +249,69 @@ def test_parser():
+               preds6[3].text.startswith("Slovenia. Top League. Women"))
+ 
+ 
++    # ── Регрессия: заголовок со СТРОЧНЫМИ словами ──
++    # Баг: строгий заголовок требовал заглавную в каждом слове сегмента, поэтому
++    # "South American games. Women. Argentina 21-00" (строчное «games») не считался
++    # началом прогноза — строка приклеивалась к Norway, два матча становились одним
++    # (второй терялся, у первого «команда 2» превращалась в мусор).
++    text7 = (
++        "Norway. Youth League U19 20-30\n"
++        "Flint II U19 — Runar/Goif/Helgerod II U19\n"
++        "South American games. Women. Argentina 21-00\n"
++        "Uruguay U20 W — Paraguay U20 W"
++    )
++    preds7 = parser.parse_predictions(text7, 3, "manual")
++    check("Заголовок со строчным словом ('South American games.') → 2 прогноза", len(preds7) == 2)
++    if len(preds7) == 2:
++        check("  П1 (Norway) не проглотил второй матч",
++              "Runar" in preds7[0].text and "Argentina" not in preds7[0].text)
++        check("  П2 сохранил заголовок целиком",
++              preds7[1].text.startswith("South American games. Women. Argentina 21-00"))
++        check("  Команды П1 извлекаются чисто (без хвоста второго матча)",
++              "Paraguay" not in fonbet.extract_teams_from_prediction(preds7[0].text)[1])
++
++    # Те же матчи, но каждый прогноз одной строкой
++    text7b = (
++        "Norway. Youth League U19 20-30 Flint II U19 — Runar/Goif/Helgerod II U19\n"
++        "South American games. Women. Argentina 21-00 Uruguay U20 W — Paraguay U20 W"
++    )
++    check("То же, прогноз одной строкой → 2 прогноза",
++          len(parser.parse_predictions(text7b, 3, "manual")) == 2)
++
++    # Строчные соединители в названии страны — и в середине, и первой строкой
++    text8 = (
++        "Bosnia and Herzegovina. Premier League 21-00\n"
++        "Zrinjski — Borac\n"
++        "п1 5+\n"
++        "Norway. Youth League U19 20-30\n"
++        "Flint II U19 — Runar II U19"
++    )
++    check("'Bosnia and Herzegovina.' первой строкой не теряется",
++          len(parser.parse_predictions(text8, 3, "manual")) == 2)
++
++    # Заголовок со строчным словом, время отдельной строкой следом
++    text9 = (
++        "Norway. Youth League U19 20-30\n"
++        "Flint II U19 — Runar II U19\n"
++        "South American games. Women\n"
++        "21-00\n"
++        "Uruguay U20 W — Paraguay U20 W"
++    )
++    check("Строчный заголовок + время отдельной строкой → 2 прогноза",
++          len(parser.parse_predictions(text9, 3, "manual")) == 2)
++
++    # Защита от ложных срабатываний: строка-комментарий с точкой — не заголовок
++    text10 = (
++        "Norway. Youth League U19 20-30\n"
++        "Flint II U19 — Runar II U19\n"
++        "Берём на победу хозяев. Кэф высокий\n"
++        "Ставка после 20-30. Ждём кэф\n"
++        "7+"
++    )
++    check("Комментарии с точкой не становятся новым прогнозом",
++          len(parser.parse_predictions(text10, 3, "manual")) == 1)
++
++
+ # ── Тесты извлечения команд ──────────────────────────────────────────────────
+ 
+ def test_extract_teams():
+@@ -532,6 +597,83 @@ def test_settings_migration():
+           s2.notify_underdog is True and s2.notify_voice is True)
+ 
+ 
++def test_live_message():
++    """Лайв-уведомление ВСЕГДА дублирует прогноз (раньше — только если не было «линии»)."""
++    print("\n[Лайв-уведомление]")
++    pred = "Romania. Liga 3. Group 6 20-00 CSM Targu Jiu — CS Drobeta-Turnu Severin см стату равные +-"
++    msg = scheduler._format_live_message("CSM Targu Jiu", "CS Drobeta-Turnu Severin",
++                                         "П1: 1.75  |  П2: 3.65", pred)
++    check("Заголовок лайва на месте", msg.startswith("🔴 Матч вышел в лайв!"))
++    check("Кэфы на месте", "П1: 1.75" in msg)
++    check("Прогноз продублирован", "📝 Прогноз:\n" + pred in msg)
++    msg2 = scheduler._format_live_message("A", "B", "(коэф. так и не появились)", "Soccer. 18-00 A — B п1")
++    check("Прогноз есть и когда кэфы не появились", "📝 Прогноз:" in msg2)
++
++
++def test_voice():
++    """Слежение за войсом: кулдаун, откат при недоставке, диагностика."""
++    print("\n[Слежение за войсом Discord]")
++    import asyncio
++    dl = discord_listener
++    dl.config.DISCORD_VOICE_USER_ID = 111
++    dl.config.DISCORD_VOICE_CHANNEL_ID = 222
++    dl.config.VOICE_COOLDOWN_SEC = 600
++
++    sent = []
++    state = {"recipients": [1, 2], "delivered": 2}
++
++    def fake_recipients(field):
++        return list(state["recipients"])
++
++    async def fake_send(recipients, text):
++        sent.append(text)
++        return state["delivered"]
++
++    dl._recipients_for = fake_recipients
++    dl._send_tg = fake_send
++
++    def run(kind):
++        asyncio.run(dl._voice_notify(kind, "Admin", "Общий"))
++
++    dl._voice_last_sent.update({"join": 0.0, "leave": 0.0})
++    run("join")
++    check("Заход → отправлено", len(sent) == 1 and "зашёл" in sent[0])
++    run("join")
++    check("Повторный заход внутри кулдауна → тишина", len(sent) == 1)
++
++    dl._voice_last_sent.update({"join": 0.0, "leave": 0.0})
++    sent.clear()
++    state["delivered"] = 0
++    run("join")
++    state["delivered"] = 2
++    run("join")
++    check("Telegram не принял → кулдаун откатывается, следующая попытка идёт", len(sent) == 2)
++
++    dl._voice_last_sent.update({"join": 0.0, "leave": 0.0})
++    sent.clear()
++    state["recipients"] = []
++    run("leave")
++    check("Нет получателей → ничего не шлём", not sent)
++    state["recipients"] = [1]
++    run("leave")
++    check("Получатели появились → выход уходит (кулдаун не сжёгся)",
++          len(sent) == 1 and "вышел" in sent[0])
++
++    # Диагностика /voice
++    class _Client:
++        def is_closed(self): return False
++        def get_channel(self, _id): return None
++        guilds = []
++
++    dl._client_ref = _Client()
++    st = dl.get_voice_status()
++    check("/voice: канал не виден боту — сказано прямо", "НЕ видит этот канал" in st)
++    dl.config.DISCORD_VOICE_CHANNEL_ID = 0
++    check("/voice: без переменных — сказано, что выключено", "Выключено" in dl.get_voice_status())
++    dl._client_ref = None
++
++
++
+ if __name__ == "__main__":
+     print("=" * 50)
+     print("ТЕСТЫ BET BOT")
+@@ -549,6 +691,8 @@ if __name__ == "__main__":
+     test_underdog()
+     test_bookmakers_parser()
+     test_settings_migration()
++    test_live_message()
++    test_voice()
+ 
+     print("\n" + "=" * 50)
+     print(f"Пройдено: {_passed}  |  Провалено: {_failed}")

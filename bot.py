@@ -14,6 +14,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# httpx на INFO пишет строку на каждый getUpdates (раз в ~10 сек) — она забивает
+# логи Railway (в выгрузке на 1000 строк остаётся 99% шума) и содержит BOT_TOKEN
+# прямо в URL. Оставляем только предупреждения/ошибки.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 
 def start_discord_in_background():
     if not config.DISCORD_TOKEN:
@@ -78,6 +84,7 @@ def main():
     app.add_handler(CommandHandler("debug",     handlers.cmd_debug))
     app.add_handler(CommandHandler("checkfonbet", handlers.cmd_checkfonbet))
     app.add_handler(CommandHandler("syncdiscord", handlers.cmd_syncdiscord))
+    app.add_handler(CommandHandler("voice",       handlers.cmd_voice))
     app.add_handler(CommandHandler("factors",     handlers.cmd_factors))
     app.add_handler(CommandHandler("bk",          handlers.cmd_bk))
     app.add_handler(CommandHandler("broadcast", handlers.cmd_broadcast))

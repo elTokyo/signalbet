@@ -49,6 +49,8 @@ parser = _load('parser')
 fonbet = _load('fonbet')
 discord_listener = _load('discord_listener')
 bookmakers = _load('bookmakers')
+sys.modules.setdefault('auth', MagicMock())   # auth.py для тестов не нужен
+scheduler = _load('scheduler')
 
 # Счётчики
 _passed = 0
@@ -245,6 +247,69 @@ def test_parser():
               preds6[2].text.startswith("Myanmar (Burma). Youth League U20"))
         check("  П4 (Slovenia) не склеен с П3",
               preds6[3].text.startswith("Slovenia. Top League. Women"))
+
+
+    # ── Регрессия: заголовок со СТРОЧНЫМИ словами ──
+    # Баг: строгий заголовок требовал заглавную в каждом слове сегмента, поэтому
+    # "South American games. Women. Argentina 21-00" (строчное «games») не считался
+    # началом прогноза — строка приклеивалась к Norway, два матча становились одним
+    # (второй терялся, у первого «команда 2» превращалась в мусор).
+    text7 = (
+        "Norway. Youth League U19 20-30\n"
+        "Flint II U19 — Runar/Goif/Helgerod II U19\n"
+        "South American games. Women. Argentina 21-00\n"
+        "Uruguay U20 W — Paraguay U20 W"
+    )
+    preds7 = parser.parse_predictions(text7, 3, "manual")
+    check("Заголовок со строчным словом ('South American games.') → 2 прогноза", len(preds7) == 2)
+    if len(preds7) == 2:
+        check("  П1 (Norway) не проглотил второй матч",
+              "Runar" in preds7[0].text and "Argentina" not in preds7[0].text)
+        check("  П2 сохранил заголовок целиком",
+              preds7[1].text.startswith("South American games. Women. Argentina 21-00"))
+        check("  Команды П1 извлекаются чисто (без хвоста второго матча)",
+              "Paraguay" not in fonbet.extract_teams_from_prediction(preds7[0].text)[1])
+
+    # Те же матчи, но каждый прогноз одной строкой
+    text7b = (
+        "Norway. Youth League U19 20-30 Flint II U19 — Runar/Goif/Helgerod II U19\n"
+        "South American games. Women. Argentina 21-00 Uruguay U20 W — Paraguay U20 W"
+    )
+    check("То же, прогноз одной строкой → 2 прогноза",
+          len(parser.parse_predictions(text7b, 3, "manual")) == 2)
+
+    # Строчные соединители в названии страны — и в середине, и первой строкой
+    text8 = (
+        "Bosnia and Herzegovina. Premier League 21-00\n"
+        "Zrinjski — Borac\n"
+        "п1 5+\n"
+        "Norway. Youth League U19 20-30\n"
+        "Flint II U19 — Runar II U19"
+    )
+    check("'Bosnia and Herzegovina.' первой строкой не теряется",
+          len(parser.parse_predictions(text8, 3, "manual")) == 2)
+
+    # Заголовок со строчным словом, время отдельной строкой следом
+    text9 = (
+        "Norway. Youth League U19 20-30\n"
+        "Flint II U19 — Runar II U19\n"
+        "South American games. Women\n"
+        "21-00\n"
+        "Uruguay U20 W — Paraguay U20 W"
+    )
+    check("Строчный заголовок + время отдельной строкой → 2 прогноза",
+          len(parser.parse_predictions(text9, 3, "manual")) == 2)
+
+    # Защита от ложных срабатываний: строка-комментарий с точкой — не заголовок
+    text10 = (
+        "Norway. Youth League U19 20-30\n"
+        "Flint II U19 — Runar II U19\n"
+        "Берём на победу хозяев. Кэф высокий\n"
+        "Ставка после 20-30. Ждём кэф\n"
+        "7+"
+    )
+    check("Комментарии с точкой не становятся новым прогнозом",
+          len(parser.parse_predictions(text10, 3, "manual")) == 1)
 
 
 # ── Тесты извлечения команд ──────────────────────────────────────────────────
@@ -532,6 +597,83 @@ def test_settings_migration():
           s2.notify_underdog is True and s2.notify_voice is True)
 
 
+def test_live_message():
+    """Лайв-уведомление ВСЕГДА дублирует прогноз (раньше — только если не было «линии»)."""
+    print("\n[Лайв-уведомление]")
+    pred = "Romania. Liga 3. Group 6 20-00 CSM Targu Jiu — CS Drobeta-Turnu Severin см стату равные +-"
+    msg = scheduler._format_live_message("CSM Targu Jiu", "CS Drobeta-Turnu Severin",
+                                         "П1: 1.75  |  П2: 3.65", pred)
+    check("Заголовок лайва на месте", msg.startswith("🔴 Матч вышел в лайв!"))
+    check("Кэфы на месте", "П1: 1.75" in msg)
+    check("Прогноз продублирован", "📝 Прогноз:\n" + pred in msg)
+    msg2 = scheduler._format_live_message("A", "B", "(коэф. так и не появились)", "Soccer. 18-00 A — B п1")
+    check("Прогноз есть и когда кэфы не появились", "📝 Прогноз:" in msg2)
+
+
+def test_voice():
+    """Слежение за войсом: кулдаун, откат при недоставке, диагностика."""
+    print("\n[Слежение за войсом Discord]")
+    import asyncio
+    dl = discord_listener
+    dl.config.DISCORD_VOICE_USER_ID = 111
+    dl.config.DISCORD_VOICE_CHANNEL_ID = 222
+    dl.config.VOICE_COOLDOWN_SEC = 600
+
+    sent = []
+    state = {"recipients": [1, 2], "delivered": 2}
+
+    def fake_recipients(field):
+        return list(state["recipients"])
+
+    async def fake_send(recipients, text):
+        sent.append(text)
+        return state["delivered"]
+
+    dl._recipients_for = fake_recipients
+    dl._send_tg = fake_send
+
+    def run(kind):
+        asyncio.run(dl._voice_notify(kind, "Admin", "Общий"))
+
+    dl._voice_last_sent.update({"join": 0.0, "leave": 0.0})
+    run("join")
+    check("Заход → отправлено", len(sent) == 1 and "зашёл" in sent[0])
+    run("join")
+    check("Повторный заход внутри кулдауна → тишина", len(sent) == 1)
+
+    dl._voice_last_sent.update({"join": 0.0, "leave": 0.0})
+    sent.clear()
+    state["delivered"] = 0
+    run("join")
+    state["delivered"] = 2
+    run("join")
+    check("Telegram не принял → кулдаун откатывается, следующая попытка идёт", len(sent) == 2)
+
+    dl._voice_last_sent.update({"join": 0.0, "leave": 0.0})
+    sent.clear()
+    state["recipients"] = []
+    run("leave")
+    check("Нет получателей → ничего не шлём", not sent)
+    state["recipients"] = [1]
+    run("leave")
+    check("Получатели появились → выход уходит (кулдаун не сжёгся)",
+          len(sent) == 1 and "вышел" in sent[0])
+
+    # Диагностика /voice
+    class _Client:
+        def is_closed(self): return False
+        def get_channel(self, _id): return None
+        guilds = []
+
+    dl._client_ref = _Client()
+    st = dl.get_voice_status()
+    check("/voice: канал не виден боту — сказано прямо", "НЕ видит этот канал" in st)
+    dl.config.DISCORD_VOICE_CHANNEL_ID = 0
+    check("/voice: без переменных — сказано, что выключено", "Выключено" in dl.get_voice_status())
+    dl._client_ref = None
+
+
+
 if __name__ == "__main__":
     print("=" * 50)
     print("ТЕСТЫ BET BOT")
@@ -549,6 +691,8 @@ if __name__ == "__main__":
     test_underdog()
     test_bookmakers_parser()
     test_settings_migration()
+    test_live_message()
+    test_voice()
 
     print("\n" + "=" * 50)
     print(f"Пройдено: {_passed}  |  Провалено: {_failed}")
