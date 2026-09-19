@@ -1,0 +1,140 @@
+diff --git a/README.md b/README.md
+index 597d034..9b9c584 100644
+--- a/README.md
++++ b/README.md
+@@ -39,6 +39,8 @@ Telegram-бот для футбольных прогнозов: напомина
+ | `DISCORD_VOICE_USER_ID` | ID юзера, за которым следим в войсе (`784124183223205950`) |
+ | `DISCORD_VOICE_CHANNEL_ID` | ID голосового канала (`1088916797828382723`) |
+ 
++Оба `DISCORD_VOICE_*` нужны одновременно — если не задан любой из них, слежение выключено (`/voice` покажет какой именно). Значения в Railway → Variables вводятся без кавычек (`784124183223205950`, не `"784124183223205950"`), хотя лишние кавычки бот теперь тоже терпит. ID включаются в Discord: Настройки → Расширенные → Режим разработчика, дальше ПКМ по каналу/пользователю → «Копировать ID».
++
+ ### Дополнительные
+ 
+ | Переменная | По умолчанию | Описание |
+diff --git a/config.py b/config.py
+index d5d3ec8..c23b9ff 100644
+--- a/config.py
++++ b/config.py
+@@ -1,5 +1,22 @@
+ import os
+ 
++
++def _env_int(name: str, default: int = 0) -> int:
++    """
++    int из переменной окружения. Терпит кавычки и пробелы вокруг значения:
++    из .env-привычки легко вставить в Railway NAME="123" вместе с кавычками, и
++    раньше это роняло бота на старте с ValueError. Мусор -> default + строка в лог.
++    """
++    raw = os.getenv(name, "").strip().strip("\"'").strip()
++    if not raw:
++        return default
++    try:
++        return int(raw)
++    except ValueError:
++        print(f"[config] {name}={raw!r} - не число, использую {default}")
++        return default
++
++
+ # ── Telegram ─────────────────────────────────────────────────────────────────
+ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ 
+@@ -19,24 +36,24 @@ GIST_ID      = os.getenv("GIST_ID", "")
+ 
+ # ── Discord (опционально) ────────────────────────────────────────────────────
+ DISCORD_TOKEN             = os.getenv("DISCORD_TOKEN", "")
+-DISCORD_CHANNEL_ID        = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
+-DISCORD_TARGET_TG_CHAT_ID = int(os.getenv("DISCORD_TARGET_TG_CHAT_ID", "0"))
++DISCORD_CHANNEL_ID        = _env_int("DISCORD_CHANNEL_ID", 0)
++DISCORD_TARGET_TG_CHAT_ID = _env_int("DISCORD_TARGET_TG_CHAT_ID", 0)
+ 
+ # ── Discord: слежение за голосовым каналом ───────────────────────────────────
+ # За кем следим и в каком войсе. 0 = функция выключена.
+-DISCORD_VOICE_USER_ID    = int(os.getenv("DISCORD_VOICE_USER_ID", "0"))
+-DISCORD_VOICE_CHANNEL_ID = int(os.getenv("DISCORD_VOICE_CHANNEL_ID", "0"))
++DISCORD_VOICE_USER_ID    = _env_int("DISCORD_VOICE_USER_ID", 0)
++DISCORD_VOICE_CHANNEL_ID = _env_int("DISCORD_VOICE_CHANNEL_ID", 0)
+ # Кулдаун между уведомлениями одного типа (сек). Защита от спама при реконнектах.
+-VOICE_COOLDOWN_SEC = int(os.getenv("VOICE_COOLDOWN_SEC", "600"))
++VOICE_COOLDOWN_SEC = _env_int("VOICE_COOLDOWN_SEC", 600)
+ # Пауза перед уведомлением о выходе: если человек вернулся за это время —
+ # считаем это реконнектом и не шлём ни «вышел», ни «зашёл».
+-VOICE_LEAVE_GRACE_SEC = int(os.getenv("VOICE_LEAVE_GRACE_SEC", "60"))
++VOICE_LEAVE_GRACE_SEC = _env_int("VOICE_LEAVE_GRACE_SEC", 60)
+ 
+ # ── Параметры напоминаний ────────────────────────────────────────────────────
+ NOTIFY_BEFORE_MINUTES = [30, 5]
+ # Через сколько минут после старта прогноз удаляется из общего листа.
+ # Влияет и на окно лайв-мониторинга: после удаления следить уже не за чем.
+-DELETE_AFTER_MINUTES  = int(os.getenv("DELETE_AFTER_MINUTES", "5"))
++DELETE_AFTER_MINUTES  = _env_int("DELETE_AFTER_MINUTES", 5)
+ 
+ # ── Другие БК (проверка кривых матчей) ───────────────────────────────────────
+ # URL можно переопределить переменными окружения, не трогая код —
+@@ -46,4 +63,4 @@ WINLINE_API_URL    = os.getenv("WINLINE_API_URL", "")
+ LIGASTAVOK_API_URL = os.getenv("LIGASTAVOK_API_URL", "")
+ 
+ # ── Часовой пояс по умолчанию ────────────────────────────────────────────────
+-DEFAULT_TZ_OFFSET = int(os.getenv("DEFAULT_TZ_OFFSET", "3"))
++DEFAULT_TZ_OFFSET = _env_int("DEFAULT_TZ_OFFSET", 3)
+diff --git a/discord_listener.py b/discord_listener.py
+index 71609e1..8962c78 100644
+--- a/discord_listener.py
++++ b/discord_listener.py
+@@ -271,7 +271,10 @@ def get_voice_status() -> str:
+     """Текст для /voice: включено ли слежение и что бот реально видит."""
+     lines = ["🎧 Слежение за войсом Discord", ""]
+     if not _voice_enabled():
+-        lines.append("Выключено: не заданы DISCORD_VOICE_USER_ID и/или DISCORD_VOICE_CHANNEL_ID.")
++        u, c = config.DISCORD_VOICE_USER_ID, config.DISCORD_VOICE_CHANNEL_ID
++        lines.append("Выключено: в переменных окружения бота (Railway → Variables) не хватает:")
++        lines.append(f"  DISCORD_VOICE_USER_ID:    {u or 'НЕ ЗАДАН'}")
++        lines.append(f"  DISCORD_VOICE_CHANNEL_ID: {c or 'НЕ ЗАДАН'}")
+         return "\n".join(lines)
+ 
+     lines.append(f"Цель (user): {config.DISCORD_VOICE_USER_ID}")
+diff --git a/test_bot.py b/test_bot.py
+index 71782af..32e064a 100644
+--- a/test_bot.py
++++ b/test_bot.py
+@@ -669,10 +669,32 @@ def test_voice():
+     st = dl.get_voice_status()
+     check("/voice: канал не виден боту — сказано прямо", "НЕ видит этот канал" in st)
+     dl.config.DISCORD_VOICE_CHANNEL_ID = 0
+-    check("/voice: без переменных — сказано, что выключено", "Выключено" in dl.get_voice_status())
++    st = dl.get_voice_status()
++    check("/voice: без переменных — сказано, что выключено", "Выключено" in st)
++    check("/voice: прямо названа недостающая переменная",
++          "DISCORD_VOICE_CHANNEL_ID: НЕ ЗАДАН" in st and "DISCORD_VOICE_USER_ID:    111" in st)
+     dl._client_ref = None
+ 
+ 
++def test_env_int():
++    """Числовые переменные окружения переживают кавычки/пробелы/мусор."""
++    print("\n[Числовые переменные окружения]")
++    import config as cfg
++    cases = [
++        ('784124183223205950', 784124183223205950),
++        ('"784124183223205950"', 784124183223205950),   # вставили с кавычками
++        ("'42'", 42),
++        ('  7  ', 7),
++        ('', 5),
++        ('abc', 5),
++    ]
++    for raw, expected in cases:
++        os.environ["_T_ENV_INT"] = raw
++        check(f"{raw!r} → {expected}", cfg._env_int("_T_ENV_INT", 5) == expected)
++    os.environ.pop("_T_ENV_INT", None)
++    check("Нет переменной → default", cfg._env_int("_T_ENV_INT_MISSING", 9) == 9)
++
++
+ 
+ if __name__ == "__main__":
+     print("=" * 50)
+@@ -693,6 +715,7 @@ if __name__ == "__main__":
+     test_settings_migration()
+     test_live_message()
+     test_voice()
++    test_env_int()
+ 
+     print("\n" + "=" * 50)
+     print(f"Пройдено: {_passed}  |  Провалено: {_failed}")

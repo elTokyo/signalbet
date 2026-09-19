@@ -271,7 +271,10 @@ def get_voice_status() -> str:
     """Текст для /voice: включено ли слежение и что бот реально видит."""
     lines = ["🎧 Слежение за войсом Discord", ""]
     if not _voice_enabled():
-        lines.append("Выключено: не заданы DISCORD_VOICE_USER_ID и/или DISCORD_VOICE_CHANNEL_ID.")
+        u, c = config.DISCORD_VOICE_USER_ID, config.DISCORD_VOICE_CHANNEL_ID
+        lines.append("Выключено: в переменных окружения бота (Railway → Variables) не хватает:")
+        lines.append(f"  DISCORD_VOICE_USER_ID:    {u or 'НЕ ЗАДАН'}")
+        lines.append(f"  DISCORD_VOICE_CHANNEL_ID: {c or 'НЕ ЗАДАН'}")
         return "\n".join(lines)
 
     lines.append(f"Цель (user): {config.DISCORD_VOICE_USER_ID}")
