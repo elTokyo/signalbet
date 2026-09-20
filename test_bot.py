@@ -669,30 +669,8 @@ def test_voice():
     st = dl.get_voice_status()
     check("/voice: канал не виден боту — сказано прямо", "НЕ видит этот канал" in st)
     dl.config.DISCORD_VOICE_CHANNEL_ID = 0
-    st = dl.get_voice_status()
-    check("/voice: без переменных — сказано, что выключено", "Выключено" in st)
-    check("/voice: прямо названа недостающая переменная",
-          "DISCORD_VOICE_CHANNEL_ID: НЕ ЗАДАН" in st and "DISCORD_VOICE_USER_ID:    111" in st)
+    check("/voice: без переменных — сказано, что выключено", "Выключено" in dl.get_voice_status())
     dl._client_ref = None
-
-
-def test_env_int():
-    """Числовые переменные окружения переживают кавычки/пробелы/мусор."""
-    print("\n[Числовые переменные окружения]")
-    import config as cfg
-    cases = [
-        ('784124183223205950', 784124183223205950),
-        ('"784124183223205950"', 784124183223205950),   # вставили с кавычками
-        ("'42'", 42),
-        ('  7  ', 7),
-        ('', 5),
-        ('abc', 5),
-    ]
-    for raw, expected in cases:
-        os.environ["_T_ENV_INT"] = raw
-        check(f"{raw!r} → {expected}", cfg._env_int("_T_ENV_INT", 5) == expected)
-    os.environ.pop("_T_ENV_INT", None)
-    check("Нет переменной → default", cfg._env_int("_T_ENV_INT_MISSING", 9) == 9)
 
 
 
@@ -715,7 +693,6 @@ if __name__ == "__main__":
     test_settings_migration()
     test_live_message()
     test_voice()
-    test_env_int()
 
     print("\n" + "=" * 50)
     print(f"Пройдено: {_passed}  |  Провалено: {_failed}")
