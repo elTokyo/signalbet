@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Optional
 import uuid
 
 
@@ -17,6 +18,10 @@ class Prediction:
     leon_notified: bool = False
     close_match_notified: bool = False
     source: str = "manual"
+    # Происхождение из Discord (старые записи в Gist без этих полей читаются нормально)
+    msg_id: Optional[str] = None          # постоянный id Discord-сообщения
+    first_seen_at: Optional[str] = None   # когда бот впервые увидел матч (UTC, ISO)
+    date_basis: Optional[str] = None      # чем обоснована дата матча (см. match_dates)
 
     def to_dict(self) -> dict:
         return {
@@ -31,6 +36,9 @@ class Prediction:
             "leon_notified": self.leon_notified,
             "close_match_notified": self.close_match_notified,
             "source": self.source,
+            "msg_id": self.msg_id,
+            "first_seen_at": self.first_seen_at,
+            "date_basis": self.date_basis,
         }
 
     @classmethod
@@ -47,6 +55,9 @@ class Prediction:
             leon_notified=d.get("leon_notified", False),
             close_match_notified=d.get("close_match_notified", False),
             source=d.get("source", "manual"),
+            msg_id=d.get("msg_id"),
+            first_seen_at=d.get("first_seen_at"),
+            date_basis=d.get("date_basis"),
         )
 
 

@@ -3,21 +3,25 @@ Discord-бот: слушает текстовый канал, парсит со�
 и сохраняет в общую БД (storage.py).
 
 Три источника прогнозов:
-1. on_message      — новое сообщение (мгновенно)
-2. on_message_edit — редактирование сообщения (мгновенно)
-3. periodic_recheck — перечит последних сообщений раз в 15 минут (страховка)
+1. on_message          — новое сообщение (мгновенно)
+2. on_raw_message_edit — редактирование сообщения (мгновенно; raw-событие приходит и для
+                         сообщений вне кэша бота — например опубликованных до рестарта)
+3. periodic_recheck    — перечит последних сообщений раз в 15 минут (страховка)
 
-Дубли отсекаются автоматически в storage.add_predictions (по тексту).
+Все три пути идут через storage.apply_discord_messages: дата КАЖДОГО матча определяется
+по моменту его появления в сообщении (публикация / правка), а не по возрасту сообщения
+(см. match_dates.py). Повторная обработка и параллельные события дублей не создают.
 """
 import asyncio
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 import discord
 import aiohttp
 
 import storage
 import config
-from parser import parse_predictions, format_time_local, display_text_without_time
+from parser import format_time_local, display_text_without_time
+from match_dates import can_still_matter
 
 logger = logging.getLogger(__name__)
 
@@ -35,26 +39,35 @@ _client_ref: discord.Client | None = None
 _loop_ref = None
 
 
-# Окно свежести сообщения. Прогнозы постят вечером накануне (22-23 МСК),
-# матчи идут вечер/ночь/утро. Нужно окно покрывающее этот цикл, но не сутки+
-# (иначе сыгранные вчерашние добавятся снова). 14 часов — баланс.
-# Главная защита от повторного добавления сыгранных — в парсере (игнор начавшихся).
-MESSAGE_FRESHNESS_HOURS = 14
+def _naive_utc(dt):
+    """aware datetime из discord.py → naive UTC (так хранится время во всём проекте)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
-def _is_fresh(message: discord.Message) -> bool:
+def _snapshot(message: discord.Message) -> dict:
+    """Снимок сообщения: постоянный id, время публикации/правки (отдельно!) и текст."""
+    return {
+        "id": str(message.id),
+        "created_at": _naive_utc(message.created_at),
+        "edited_at": _naive_utc(message.edited_at),
+        "content": message.content or "",
+    }
+
+
+async def _apply_and_notify(snapshots: list[dict], label: str, **kwargs) -> dict:
     """
-    True если сообщение создано/отредактировано за последние MESSAGE_FRESHNESS_HOURS часов.
-    Покрывает вечерние публикации накануне на матчи следующего дня,
-    но отсекает сообщения старше суток.
+    Применяет снимки к расписанию и шлёт уведомление о реально добавленных прогнозах.
+    storage ходит в Gist синхронным requests — уносим из event loop Discord.
     """
-    now = datetime.now(timezone.utc)
-    threshold = now - timedelta(hours=MESSAGE_FRESHNESS_HOURS)
-    if message.created_at >= threshold:
-        return True
-    if message.edited_at is not None and message.edited_at >= threshold:
-        return True
-    return False
+    stats = await asyncio.to_thread(storage.apply_discord_messages, snapshots, **kwargs)
+    added = stats.get("added_preds", [])
+    if added:
+        await _notify_added(added, label)
+    return stats
 
 
 def trigger_manual_recheck() -> tuple[bool, str]:
@@ -77,7 +90,9 @@ def trigger_manual_recheck() -> tuple[bool, str]:
             f"Сообщений: {stats['messages']}\n"
             f"➕ Добавлено: {stats['added']}\n"
             f"✏️ Обновлено: {stats['updated']}\n"
-            f"🗑 Удалено: {stats['removed']}"
+            f"🗑 Удалено: {stats['removed']}\n"
+            f"⏭ Пропущено: прошедших {stats['skipped_stale']}, "
+            f"с неясной датой {stats['skipped_undetermined']}, дублей {stats['skipped_duplicate']}"
         )
         return True, info
     except Exception as e:
@@ -87,34 +102,36 @@ def trigger_manual_recheck() -> tuple[bool, str]:
 
 async def _manual_recheck(label: str = "автопроверка") -> dict:
     """
-    Полная синхронизация листа со свежими сообщениями Discord.
+    Перечит последних сообщений канала. Актуальность решается не возрастом сообщения,
+    а датой каждого матча (storage.apply_discord_messages); здесь отсекается только
+    заведомо мёртвая история (match_dates.can_still_matter).
     label — пометка источника для уведомления о добавленных прогнозах.
     """
     ch = _client_ref.get_channel(config.DISCORD_CHANNEL_ID)
     if not ch:
         raise RuntimeError("канал не найден")
 
-    # Собираем ВСЕ прогнозы из свежих сообщений в один список
-    all_preds = []
-    msg_count = 0
+    snapshots = []
+    fetched = 0
+    oldest = None
+    now = datetime.utcnow()
     async for msg in ch.history(limit=RECHECK_HISTORY_LIMIT):
+        fetched += 1
+        oldest = _naive_utc(msg.created_at)
         if msg.author == _client_ref.user:
             continue
-        if not _is_fresh(msg):
+        snap = _snapshot(msg)
+        if not can_still_matter(snap["created_at"], snap["edited_at"], now):
             continue
-        preds = parse_predictions(msg.content, config.DEFAULT_TZ_OFFSET, source="discord")
-        all_preds.extend(preds)
-        msg_count += 1
+        snapshots.append(snap)
 
-    # Синхронизируем: добавить новые, обновить изменённые, удалить пропавшие
-    stats = storage.sync_from_discord(all_preds)
+    # Если история прочитана не целиком, удалённые сообщения старше oldest отличить нельзя
+    scan_floor = oldest if fetched >= RECHECK_HISTORY_LIMIT else datetime.min
 
-    # Уведомляем о добавленных прогнозах с пометкой источника
-    added_preds = stats.get("added_preds", [])
-    if added_preds:
-        await _notify_added(added_preds, label)
-
-    return {"messages": msg_count, **stats}
+    stats = await _apply_and_notify(
+        snapshots, label, full_scan=True, scan_floor=scan_floor,
+    )
+    return {"messages": len(snapshots), **stats}
 
 
 async def _notify_added(preds: list, label: str):
@@ -396,17 +413,11 @@ def _chunk_lines(lines: list[str], limit: int) -> list[str]:
     return messages
 
 
-async def _process_static(content: str, origin: str, label: str = "новое сообщение"):
-    """Обработка одного нового сообщения (on_message)."""
-    preds = parse_predictions(content, config.DEFAULT_TZ_OFFSET, source="discord")
-    if not preds:
-        return
-    added = storage.add_predictions(new_preds=preds)
-    if added <= 0:
-        return
-    logger.info(f"Discord [{origin}]: добавлено {added} новых прогнозов")
-    # Берём именно добавленные (последние added) и уведомляем с пометкой
-    await _notify_added(preds[-added:], label)
+async def _process_message(message: discord.Message, label: str):
+    """Обработка одного нового или изменённого сообщения."""
+    stats = await _apply_and_notify([_snapshot(message)], label)
+    if stats["added"] or stats["updated"] or stats["removed"]:
+        logger.info(f"Discord [{label}] msg {message.id}: +{stats['added']} ~{stats['updated']} -{stats['removed']}")
 
 
 def run_discord_listener():
@@ -543,22 +554,41 @@ def run_discord_listener():
             return
         if message.channel.id != config.DISCORD_CHANNEL_ID:
             return
-        if not _is_fresh(message):
-            return
-        await _process_static(message.content, "new")
+        try:
+            await _process_message(message, "новое сообщение")
+        except Exception as e:
+            logger.exception(f"on_message error (msg {message.id}): {e}")
 
     @client.event
-    async def on_message_edit(before: discord.Message, after: discord.Message):
-        if after.author == client.user:
+    async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
+        # raw-событие, а не on_message_edit: то приходит только для сообщений из кэша
+        # бота, и правка сообщения, опубликованного до рестарта, терялась до перечита.
+        if payload.channel_id != config.DISCORD_CHANNEL_ID:
             return
-        if after.channel.id != config.DISCORD_CHANNEL_ID:
-            return
-        if before.content == after.content:
-            return
-        logger.info("Discord: обнаружено редактирование — запускаю синхронизацию")
         try:
-            await _manual_recheck("изменённое сообщение")
+            ch = client.get_channel(payload.channel_id) or await client.fetch_channel(payload.channel_id)
+            try:
+                # актуальная версия сообщения (в payload.data может быть неполная)
+                message = await ch.fetch_message(payload.message_id)
+            except discord.NotFound:
+                removed = await asyncio.to_thread(storage.retract_discord_message, payload.message_id)
+                logger.info(f"Discord: сообщение {payload.message_id} удалено до обработки правки, убрано {removed}")
+                return
+            if message.author == client.user:
+                return
+            logger.info(f"Discord: правка сообщения {message.id} — обрабатываю")
+            await _process_message(message, "изменённое сообщение")
         except Exception as e:
-            logger.error(f"on_message_edit sync error: {e}")
+            logger.exception(f"on_raw_message_edit error (msg {payload.message_id}): {e}")
+
+    @client.event
+    async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+        if payload.channel_id != config.DISCORD_CHANNEL_ID:
+            return
+        try:
+            removed = await asyncio.to_thread(storage.retract_discord_message, payload.message_id)
+            logger.info(f"Discord: сообщение {payload.message_id} удалено, убрано из расписания: {removed}")
+        except Exception as e:
+            logger.exception(f"on_raw_message_delete error (msg {payload.message_id}): {e}")
 
     client.run(config.DISCORD_TOKEN, log_handler=None)

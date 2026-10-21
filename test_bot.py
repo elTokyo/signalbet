@@ -8,6 +8,7 @@
 - извлечение команд
 - парсинг ставок (победитель/фора)
 - логику кривизны (СЛУЧАЙ 1/2/3)
+- даты матчей из Discord-сообщений (публикация/правка/полночь/дубли/гонки) — с контролируемым временем
 """
 import sys
 import os
@@ -45,9 +46,11 @@ def _load(name):
 
 # Загружаем модули
 models = _load('models')
+match_dates = _load('match_dates')
 parser = _load('parser')
 fonbet = _load('fonbet')
 discord_listener = _load('discord_listener')
+storage = sys.modules['storage']   # импортирован discord_listener-ом
 bookmakers = _load('bookmakers')
 sys.modules.setdefault('auth', MagicMock())   # auth.py для тестов не нужен
 scheduler = _load('scheduler')
@@ -674,6 +677,451 @@ def test_voice():
 
 
 
+# ── Даты матчей: дата определяется по самому матчу, а не по возрасту сообщения ─
+
+import copy
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+TZ = 3  # МСК: в тестах все «локальные» времена — UTC+3
+
+
+def L(day, hour, minute=0):
+    """Локальное (МСК) время 'day октября 2026' → naive UTC, как хранится в проекте."""
+    return datetime(2026, 10, day, hour, minute) - timedelta(hours=TZ)
+
+
+def lt(dt):
+    """naive UTC → строка локального времени 'дд HH:MM' для сравнений в тестах."""
+    d = dt + timedelta(hours=TZ)
+    return f"{d.day:02d} {d:%H:%M}"
+
+
+def M(hhmm, a, b):
+    """Строка прогноза в старом формате: 'Футбол. Лига. HH-MM А — Б п1 2+'."""
+    return f"Футбол. Лига. {hhmm.replace(':', '-')} {a} — {b} п1 2+"
+
+
+def snap(mid, created, content, edited=None):
+    return {"id": str(mid), "created_at": created, "edited_at": edited, "content": content}
+
+
+class _FakeGist:
+    """In-memory замена gist_storage: каждое чтение — свежая копия, как JSON из сети."""
+    FILE_PREDICTIONS = "predictions.json"
+    FILE_SETTINGS = "settings.json"
+
+    def __init__(self):
+        self.db = {}
+        self.writes = 0
+
+    def read(self, name):
+        return copy.deepcopy(self.db.get(name, {}))
+
+    def write(self, name, data):
+        self.db[name] = copy.deepcopy(data)
+        self.writes += 1
+
+    def invalidate_cache(self):
+        pass
+
+
+class _Env:
+    """Подменяет Gist в storage на время теста."""
+    def __enter__(self):
+        self.gist = _FakeGist()
+        self._old = storage.gist_storage
+        storage.gist_storage = self.gist
+        return self
+
+    def __exit__(self, *a):
+        storage.gist_storage = self._old
+
+    def apply(self, snaps, now, **kw):
+        return storage.apply_discord_messages(snaps, now=now, tz_offset=TZ, **kw)
+
+    def sched(self):
+        return sorted(storage.load_predictions(), key=lambda p: p.match_time)
+
+    def times(self):
+        return [lt(p.match_time) for p in self.sched()]
+
+    def ledger(self):
+        return self.gist.db.get("predictions.json", {}).get(storage.LEDGER_KEY, {})
+
+
+def test_match_dates_rules():
+    print("\n[Даты матчей: правила и границы суток]")
+    R = match_dates.resolve_match_datetime
+
+    def res(h, m, anchor, hint=None, tz=TZ):
+        r = R(h, m, hint, anchor, tz)
+        return (lt(r.dt) if r.dt else None), r.basis
+
+    # день в день
+    check("Пост 11:00, матч 18:00 → тот же день", res(18, 0, L(20, 11)) == ("20 18:00", "anchor:same-day"))
+    check("Пост 11:00, ночной матч 01:00 → следующий день", res(1, 0, L(20, 11)) == ("21 01:00", "anchor:next-day-night-match"))
+    check("Пост 11:00, время 09:00 раньше публикации и не ночь → не определено",
+          res(9, 0, L(20, 11)) == (None, "undetermined"))
+    # вечер на завтра
+    check("Пост 23:00, матч 12:00 → завтра", res(12, 0, L(20, 23)) == ("21 12:00", "anchor:next-day-evening-post"))
+    check("Пост 18:00 (граница «вечера»), матч 10:00 → завтра", res(10, 0, L(20, 18)) == ("21 10:00", "anchor:next-day-evening-post"))
+    check("Пост 17:59, матч 10:00 → не определено", res(10, 0, L(20, 17, 59)) == (None, "undetermined"))
+    # границы полуночи
+    check("Пост 23:59, матч 00:30 → 21-е 00:30", res(0, 30, L(20, 23, 59)) == ("21 00:30", "anchor:next-day-evening-post"))
+    check("Пост 23:59, матч 23:59 → тот же день", res(23, 59, L(20, 23, 59)) == ("20 23:59", "anchor:same-day"))
+    check("Пост 00:10, матч 01:00 → тот же день (20-е)", res(1, 0, L(20, 0, 10)) == ("20 01:00", "anchor:same-day"))
+    check("Матч начался 10 мин до публикации → всё ещё тот же день (grace)", res(10, 50, L(20, 11))[0] == "20 10:50")
+    # сутки по UTC и по местному времени — разные
+    anchor = datetime(2026, 10, 20, 21, 30)   # 20.10 21:30 UTC = 21.10 00:30 МСК
+    check("Граница суток считается по местному поясу, а не по UTC", res(12, 0, anchor)[0] == "21 12:00")
+    r10 = R(9, 0, None, anchor, 10)
+    check("UTC+10: пост 07:30 местн., матч 09:00 → 21.10 09:00 местн. (= 20.10 23:00 UTC)",
+          r10.dt == datetime(2026, 10, 20, 23, 0) and r10.basis == "anchor:same-day")
+    # явные даты
+    check("Явная дата 22.10 приоритетнее правила",
+          res(12, 0, L(20, 11), match_dates.DateHint(day=22, month=10))[0] == "22 12:00")
+    check("«Завтра» считается от момента публикации, а не от «сейчас»",
+          res(12, 0, L(20, 11), match_dates.DateHint(rel_days=1))[0] == "21 12:00")
+    check("Явная дата без года: ближайший к публикации год (31.12 при публикации 30.12.2026)",
+          lt(R(12, 0, match_dates.DateHint(day=1, month=1), datetime(2026, 12, 30, 9, 0), TZ).dt) .startswith("01 "))
+    check("Невозможная дата (31.02) → не определено",
+          R(12, 0, match_dates.DateHint(day=31, month=2), L(20, 11), TZ).dt is None)
+    # отсечка заведомо мёртвой истории
+    now = L(21, 9)
+    check("История: сообщение 5-дневной давности без правок не читаем", not match_dates.can_still_matter(L(16, 11), None, now))
+    check("История: старое сообщение, правленное недавно, читаем", match_dates.can_still_matter(L(16, 11), L(21, 1), now))
+    check("История: вчерашнее сообщение читаем", match_dates.can_still_matter(L(20, 11), None, now))
+
+
+def test_date_headers_parser():
+    print("\n[Парсер: даты в тексте]")
+    ph = parser._parse_date_header
+    check("Заголовок «21.10»", ph("21.10") == match_dates.DateHint(day=21, month=10))
+    check("Заголовок «Вторник, 21 октября»", ph("Вторник, 21 октября") == match_dates.DateHint(day=21, month=10))
+    check("Заголовок «Прогнозы на завтра:»", ph("Прогнозы на завтра:") == match_dates.DateHint(rel_days=1))
+    check("Заголовок «🔥 Сегодня 🔥»", ph("🔥 Сегодня 🔥") == match_dates.DateHint(rel_days=0))
+    check("«ТБ 2.5» — не дата", ph("ТБ 2.5") is None)
+    check("«п2 3+» — не дата", ph("п2 3+") is None)
+    check("«4 лига» — не дата", ph("4 лига") is None)
+    check("Время «18-00» — не дата", ph("18-00") is None)
+    check("Строка с командами — не заголовок", ph("Футбол. Польша. 19-00 Уния — Спуйня 21.10") is None)
+
+    blocks = parser.split_blocks("Сегодня\n" + M("18:00", "А", "Б") + "\n---------\n22.10\n" + M("12:00", "В", "Г")
+                                 + "\n" + "Футбол. Чехия. 23.10 19-00 Д — Е п1")
+    hints = [h for _b, h in blocks]
+    check("Секции: сегодня / 22.10 / инлайн 23.10 приоритетнее заголовка 22.10",
+          hints == [match_dates.DateHint(rel_days=0), match_dates.DateHint(day=22, month=10),
+                    match_dates.DateHint(day=23, month=10)])
+    check("Заголовки дат не попадают в текст прогнозов",
+          all("22.10\n" not in b and not b.startswith("Сегодня") for b, _h in blocks))
+    plain = parser.split_blocks(M("18:00", "А", "Б") + "\n" + M("19:00", "В", "Г"))
+    check("Без дат разбор прежний: 2 блока, без подсказок", len(plain) == 2 and all(h is None for _b, h in plain))
+    mt = parser.parse_predictions("Футбол. Лига. 25.12 18-00 А — Б п1", TZ, "manual")[0].match_time + timedelta(hours=TZ)
+    check("Ручной /add с явной датой 25.12 использует её", (mt.month, mt.day, mt.hour) == (12, 25, 18))
+
+
+def test_scenario_a_yesterday_message():
+    print("\n[Сценарий A: вчерашнее сообщение с прошедшими матчами]")
+    content = "\n".join([M("14:00", "Альфа", "Бета"), M("18:00", "Гамма", "Дельта"),
+                         M("20:30", "Эпсилон", "Зета"), M("01:00", "Ипсилон", "Омега")])
+    created = L(20, 11)
+    with _Env() as env:
+        st = env.apply([snap(1, created, content)], now=L(21, 9))
+        check("Вчерашнее сообщение, бот видит его 21.10 в 09:00 → в расписании пусто", env.times() == [])
+        check("Все 4 матча учтены как прошедшие", st["skipped_stale"] == 4 and st["added"] == 0)
+        check("Ночной матч 01:00 → это 21.10 01:00, к 09:00 тоже прошёл",
+              all(r["status"] == "stale" for r in env.ledger()["1"]["matches"].values()))
+    with _Env() as env:
+        st = env.apply([snap(1, created, content)], now=L(20, 11, 5))
+        check("То же сообщение в день публикации → 4 матча (включая ночной на 21-е)",
+              env.times() == ["20 14:00", "20 18:00", "20 20:30", "21 01:00"])
+        env.apply([snap(1, created, content)], now=L(21, 9))
+        check("На следующее утро записи не дублируются и не «переезжают» на сегодня",
+              env.times() == ["20 14:00", "20 18:00", "20 20:30", "21 01:00"])
+
+
+def test_scenario_b_evening_for_tomorrow():
+    print("\n[Сценарий B: вечернее сообщение с матчами на завтра]")
+    content = "\n".join([M("09:00", "А", "Б"), M("15:00", "В", "Г"), M("20:00", "Д", "Е")])
+    with _Env() as env:
+        st = env.apply([snap(2, L(20, 23), content)], now=L(20, 23, 5))
+        check("Пост 20.10 23:00 → все 3 матча на 21.10",
+              env.times() == ["21 09:00", "21 15:00", "21 20:00"] and st["added"] == 3)
+        check("Основание даты записано (вечерняя публикация)",
+              all(p.date_basis == "anchor:next-day-evening-post" for p in env.sched()))
+        check("msg_id и first_seen_at сохранены", all(p.msg_id == "2" and p.first_seen_at for p in env.sched()))
+        env.apply([snap(2, L(20, 23), content)], now=L(21, 8))
+        check("Утром 21.10 те же 3 матча, без дублей", len(env.sched()) == 3)
+
+
+def test_scenario_c_edit_adds_matches():
+    print("\n[Сценарий C: правка старого сообщения добавляет матчи]")
+    v1 = "\n".join([M("14:00", "А", "Б"), M("18:00", "В", "Г")])
+    v2 = v1 + "\n" + M("12:00", "Новая1", "Х") + "\n" + M("09:30", "Новая2", "У")
+    with _Env() as env:
+        env.apply([snap(3, L(20, 11), v1)], now=L(20, 11, 1))
+        check("11:00: два матча на сегодня", env.times() == ["20 14:00", "20 18:00"])
+        # планировщик вычистил сыгранные
+        storage.save_predictions(predictions=[])
+        st = env.apply([snap(3, L(20, 11), v2, edited=L(20, 23))], now=L(20, 23, 1))
+        check("23:00 правка: добавлено ровно 2 новых матча", st["added"] == 2)
+        check("Новые матчи — на 21.10 (anchor = время правки, а не публикации)",
+              env.times() == ["21 09:30", "21 12:00"])
+        check("Сыгранные 14:00/18:00 в расписание не вернулись", all("20 " not in t for t in env.times()))
+        check("Уведомление только о новых (added_preds = 2)", len(st["added_preds"]) == 2)
+    # 5 матчей → 8
+    five = [M(f"{h}:00", f"К{h}", f"Л{h}") for h in (13, 14, 15, 16, 17)]
+    eight = five + [M(f"{h}:00", f"К{h}", f"Л{h}") for h in (18, 19, 20)]
+    with _Env() as env:
+        env.apply([snap(4, L(20, 11), "\n".join(five))], now=L(20, 11, 1))
+        st = env.apply([snap(4, L(20, 11), "\n".join(eight), edited=L(20, 12))], now=L(20, 12, 1))
+        check("Было 5, стало 8 → добавлено только 3 (всего 8)", st["added"] == 3 and len(env.sched()) == 8)
+
+
+def test_repeat_edit_no_changes():
+    print("\n[Повторная правка без изменений]")
+    v1 = M("14:00", "А", "Б") + "\n" + M("18:00", "В", "Г")
+    with _Env() as env:
+        env.apply([snap(5, L(20, 11), v1)], now=L(20, 11, 1))
+        w = env.gist.writes
+        st = env.apply([snap(5, L(20, 11), v1)], now=L(20, 11, 2))
+        check("Тот же снимок повторно → ничего не добавлено/обновлено/удалено",
+              (st["added"], st["updated"], st["removed"]) == (0, 0, 0) and st["unchanged"] == 1)
+        check("…и в Gist ничего не пишется", env.gist.writes == w)
+        st = env.apply([snap(5, L(20, 11), v1, edited=L(20, 12))], now=L(20, 12, 1))
+        check("Правка без смены содержимого (напр. embed) → 0 изменений, 2 записи",
+              (st["added"], st["updated"], st["removed"]) == (0, 0, 0) and len(env.sched()) == 2)
+
+
+def test_time_change_of_known_match():
+    print("\n[Изменение времени известного матча]")
+    v1 = M("18:00", "А", "Б") + "\n" + M("20:00", "В", "Г")
+    v2 = M("19:30", "А", "Б") + "\n" + M("20:00", "В", "Г")
+    with _Env() as env:
+        env.apply([snap(6, L(20, 11), v1)], now=L(20, 11, 1))
+        p = [x for x in env.sched() if "А —" in x.text][0]
+        storage.update_prediction(pred_id=p.id, notified_30=True, notified_5=True)
+        pid = p.id
+        st = env.apply([snap(6, L(20, 11), v2, edited=L(20, 15))], now=L(20, 15, 1))
+        after = env.sched()
+        check("18:00 → 19:30: запись обновлена, шестого матча нет", st["updated"] == 1 and st["added"] == 0 and len(after) == 2)
+        moved = [x for x in after if x.id == pid][0]
+        check("Время и дата верны (20.10 19:30), id прежний", lt(moved.match_time) == "20 19:30")
+        check("Флаги напоминаний 30/5 мин сброшены для нового времени", not moved.notified_30 and not moved.notified_5)
+        v3 = M("01:00", "А", "Б") + "\n" + M("20:00", "В", "Г")
+        env.apply([snap(6, L(20, 11), v3, edited=L(20, 16))], now=L(20, 16, 1))
+        check("Перенос на 01:00 → следующая ночь (21.10 01:00)",
+              [lt(x.match_time) for x in env.sched() if x.id == pid] == ["21 01:00"])
+        # завершившийся матч не возвращается из-за правки текста
+        storage.save_predictions(predictions=[x for x in env.sched() if x.id != pid])   # его «вычистили»
+        env.apply([snap(6, L(20, 11), v3 + "\nстатистика", edited=L(21, 2))], now=L(21, 9))
+    with _Env() as env:
+        env.apply([snap(7, L(20, 11), M("14:00", "А", "Б"))], now=L(20, 11, 1))
+        storage.save_predictions(predictions=[])      # матч сыгран и вычищен планировщиком
+        st = env.apply([snap(7, L(20, 11), M("14:00", "А", "Б") + " ✅", edited=L(20, 18))], now=L(20, 18))
+        check("Сыгранный матч после правки текста в расписание не возвращается", env.sched() == [] and st["restored"] == 0)
+        env.apply([snap(7, L(20, 11), M("23:00", "А", "Б"), edited=L(20, 19))], now=L(20, 19))
+        check("…но если автор перенёс его на будущее время — возвращается",
+              env.times() == ["20 23:00"])
+
+
+def test_match_identity_stable():
+    print("\n[Идентичность матча при правках текста]")
+    with _Env() as env:
+        env.apply([snap(50, L(20, 11), M("18:00", "Альфа", "Бета"))], now=L(20, 11, 1))
+        pid = env.sched()[0].id
+        st = env.apply([snap(50, L(20, 11), M("18:00", "Альфа", "Бета") + " ✅", edited=L(20, 19))], now=L(20, 19))
+        check("Дописан значок «✅» → тот же матч, не новый", len(env.sched()) == 1 and env.sched()[0].id == pid and st["added"] == 0)
+        st = env.apply([snap(50, L(20, 11), M("18:00", "Альфа", "Бета ФК"), edited=L(20, 19, 5))], now=L(20, 19, 5))
+        check("Поправили название второй команды при том же времени → запись обновлена, а не добавлена вторая",
+              len(env.sched()) == 1 and env.sched()[0].id == pid)
+    with _Env() as env:
+        two = M("18:00", "Реал", "Бетис") + "\n" + M("18:00", "Реал", "Барса")
+        env.apply([snap(51, L(20, 11), two)], now=L(20, 11, 1))
+        check("Разные матчи одной команды в одно время не склеиваются", len(env.sched()) == 2)
+
+
+def test_multiple_dates_in_one_message():
+    print("\n[Несколько дат в одном сообщении]")
+    content = "\n".join([
+        "20.10", M("18:00", "А", "Б"), M("21:00", "В", "Г"),
+        "---------------",
+        "21.10", M("12:00", "Д", "Е"),
+        "---------------",
+        "Завтра", M("15:00", "Ж", "З"),   # относительно публикации → 21.10
+    ])
+    with _Env() as env:
+        env.apply([snap(8, L(20, 11), content)], now=L(20, 11, 1))
+        check("Каждый матч — на свою дату (20.10 ×2, 21.10 ×2)",
+              env.times() == ["20 18:00", "20 21:00", "21 12:00", "21 15:00"])
+        check("Основание — явная дата", all(p.date_basis == "explicit" for p in env.sched()))
+        check("Текст прогноза остаётся без строки-заголовка даты",
+              all(not p.text.startswith(("20.10", "21.10", "Завтра")) for p in env.sched()))
+    # заголовок со вчерашней датой в сегодняшнем контексте — прошедшие
+    with _Env() as env:
+        st = env.apply([snap(9, L(20, 11), content)], now=L(21, 13))
+        check("21.10 13:00: прошедшие 20.10 и 21.10 12:00 пропущены, остался 21.10 15:00",
+              env.times() == ["21 15:00"] and st["skipped_stale"] == 3)
+
+
+def test_undetermined_date():
+    print("\n[Дату нельзя определить достоверно]")
+    with _Env() as env:
+        content = M("09:00", "А", "Б") + "\n" + M("18:00", "В", "Г")
+        st = env.apply([snap(10, L(20, 11), content)], now=L(20, 11, 1))
+        check("Дневной пост, время 09:00 раньше публикации → не добавлен, 18:00 добавлен",
+              env.times() == ["20 18:00"] and st["skipped_undetermined"] == 1)
+        rec = [r for r in env.ledger()["10"]["matches"].values() if r["status"] == "undetermined"]
+        check("Причина неопределённости сохранена для повторного разбора", len(rec) == 1 and "достоверно" in rec[0]["reason"])
+    with _Env() as env:
+        # бот впервые видит сообщение, которое уже правили: неизвестно, что было в оригинале
+        content = M("14:00", "А", "Б")
+        st = env.apply([snap(11, L(20, 11), content, edited=L(20, 23))], now=L(20, 23, 5))
+        check("Холодный старт на правленом сообщении: матч 14:00 неоднозначен → не добавлен",
+              env.times() == [] and st["skipped_undetermined"] == 1)
+        st = env.apply([snap(11, L(20, 11), content, edited=L(20, 23))], now=L(20, 23, 20))
+        check("…и повторный перечит его не «додумывает»", env.times() == [])
+    with _Env() as env:
+        # то же вечернее сообщение, правка в тот же вечер: версии согласны → дата достоверна
+        content = M("12:00", "А", "Б")
+        env.apply([snap(12, L(20, 23), content, edited=L(20, 23, 40))], now=L(20, 23, 45))
+        check("Холодный старт, но публикация и правка дают одну дату → добавлен (21.10 12:00)",
+              env.times() == ["21 12:00"])
+
+
+def test_restart_reprocessing():
+    print("\n[Повторная обработка после перезапуска]")
+    content = M("14:00", "А", "Б") + "\n" + M("18:00", "В", "Г")
+    snaps = [snap(13, L(20, 11), content)]
+    with _Env() as env:
+        env.apply(snaps, now=L(20, 11, 1))
+        ids = sorted(p.id for p in env.sched())
+        for i in range(3):   # «рестарты»: тот же перечит истории канала
+            st = env.apply(snaps, now=L(20, 12 + i), full_scan=True, scan_floor=datetime.min)
+        check("3 перечита истории → те же записи с теми же id", sorted(p.id for p in env.sched()) == ids)
+        check("Уведомлений о новых нет", st["added_preds"] == [] and st["added"] == 0)
+        # потеряна запись расписания (гонка записи), реестр цел → будущий матч восстановлен тихо
+        storage.save_predictions(predictions=[p for p in env.sched() if "А —" not in p.text])
+        st = env.apply(snaps, now=L(20, 12, 30), full_scan=True, scan_floor=datetime.min)
+        check("Потерянная будущая запись восстановлена без повторного уведомления",
+              len(env.sched()) == 2 and st["restored"] == 1 and st["added_preds"] == [])
+        # старый снапшот без реестра в памяти — реестр в Gist, так что состояние переживает рестарт
+        check("Реестр сообщений хранится в Gist (переживает редеплой)", "13" in env.ledger())
+
+
+def test_legacy_and_removals():
+    print("\n[Старые записи, удаление матчей и сообщений]")
+    content = M("14:00", "Старая", "Запись") + "\n" + M("18:00", "Живая", "Запись")
+    # старая запись (без msg_id), посчитанная прежним парсером «на сегодня» из вчерашнего сообщения
+    with _Env() as env:
+        bug = models.Prediction(text=M("18:00", "Вчерашняя", "Игра"), match_time=L(21, 18), source="discord")
+        manual = models.Prediction(text=M("20:00", "Ручная", "Игра"), match_time=L(21, 20), source="manual")
+        storage.save_predictions(predictions=[bug, manual])
+        st = env.apply([snap(14, L(20, 11), M("18:00", "Вчерашняя", "Игра"))], now=L(21, 9),
+                       full_scan=True, scan_floor=datetime.min)
+        check("Баг-запись «вчерашний матч на сегодня» убрана при перечите", st["legacy_removed"] == 1)
+        check("Ручной прогноз не тронут", [p.source for p in env.sched()] == ["manual"])
+    # корректная старая запись усыновляется, а не дублируется; флаги сохраняются
+    with _Env() as env:
+        old = models.Prediction(text=M("18:00", "Живая", "Запись"), match_time=L(20, 18), source="discord", notified_30=True)
+        storage.save_predictions(predictions=[old])
+        st = env.apply([snap(15, L(20, 11), M("18:00", "Живая", "Запись"))], now=L(20, 12))
+        p = env.sched()
+        check("Запись прежней версии с верной датой привязана к сообщению (без дубля, id и флаги целы)",
+              len(p) == 1 and p[0].id == old.id and p[0].msg_id == "15" and p[0].notified_30 and st["added"] == 0)
+    # ручной прогноз с теми же командами/временем → дубль не создаётся
+    with _Env() as env:
+        manual = models.Prediction(text=M("18:00", "Живая", "Запись"), match_time=L(20, 18), source="manual")
+        storage.save_predictions(predictions=[manual])
+        st = env.apply([snap(16, L(20, 11), M("18:00", "Живая", "Запись"))], now=L(20, 12))
+        check("Совпадает с ручным прогнозом → дубль не добавлен", len(env.sched()) == 1 and st["skipped_duplicate"] == 1)
+    # одинаковый матч в двух сообщениях
+    with _Env() as env:
+        env.apply([snap(17, L(20, 11), M("18:00", "Х", "У")), snap(18, L(20, 11, 30), M("18:00", "Х", "У"))], now=L(20, 12))
+        check("Тот же матч в двух сообщениях → одна запись", len(env.sched()) == 1)
+    # автор убрал матч правкой
+    with _Env() as env:
+        both = M("18:00", "А", "Б") + "\n" + M("22:00", "В", "Г")
+        env.apply([snap(19, L(20, 11), both)], now=L(20, 12))
+        st = env.apply([snap(19, L(20, 11), M("22:00", "В", "Г"), edited=L(20, 13))], now=L(20, 13))
+        check("Матч убран из сообщения до старта → снят с расписания", env.times() == ["20 22:00"] and st["removed"] == 1)
+    with _Env() as env:
+        both = M("18:00", "А", "Б") + "\n" + M("22:00", "В", "Г")
+        env.apply([snap(23, L(20, 11), both)], now=L(20, 12))
+        # исчезновение прогноза ≠ отмена матча: уже начавшийся матч остаётся в расписании
+        st = env.apply([snap(23, L(20, 11), M("22:00", "В", "Г"), edited=L(20, 18, 30))], now=L(20, 18, 30))
+        check("Убранный из сообщения матч, который уже начался, не трогаем",
+              st["removed"] == 0 and env.times() == ["20 18:00", "20 22:00"])
+        env.apply([snap(23, L(20, 11), M("22:00", "В", "Г") + "\n" + M("18:00", "А", "Б"), edited=L(20, 18, 40))],
+                  now=L(20, 18, 40))
+        check("Автор вернул убранный матч → дубликата нет", env.times() == ["20 18:00", "20 22:00"])
+    with _Env() as env:
+        env.apply([snap(20, L(20, 11), M("18:00", "А", "Б") + "\n" + M("22:00", "В", "Г"))], now=L(20, 12))
+        n = storage.retract_discord_message(20, now=L(20, 12, 5))
+        check("Сообщение удалено из канала → его будущие матчи сняты", n == 2 and env.sched() == [])
+    with _Env() as env:
+        env.apply([snap(21, L(20, 11), M("18:00", "А", "Б"))], now=L(20, 12))
+        st = env.apply([], now=L(20, 12, 15), full_scan=True, scan_floor=datetime.min)
+        check("Перечит: сообщения больше нет в канале → матч снят", env.sched() == [] and st["removed"] == 1)
+        env.apply([snap(22, L(20, 11), M("18:00", "К", "Л"))], now=L(20, 12))
+        env.apply([], now=L(20, 12, 15), full_scan=True, scan_floor=L(20, 12))
+        check("История прочитана не до конца (scan_floor новее сообщения) → не считаем его удалённым",
+              len(env.sched()) == 1)
+
+
+def test_concurrent_events():
+    print("\n[Повторные и одновременные события]")
+    v1 = "\n".join([M("14:00", "А", "Б"), M("18:00", "В", "Г")])
+    v2 = v1 + "\n" + M("21:00", "Д", "Е")
+    with _Env() as env:
+        s1 = snap(30, L(20, 11), v1)
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(lambda _i: env.apply([s1], now=L(20, 11, 1)), range(16)))
+        check("16 одновременных одинаковых событий → ровно 2 записи, без дублей", len(env.sched()) == 2)
+        ids_once = sorted(p.id for p in env.sched())
+        s2 = snap(30, L(20, 11), v2, edited=L(20, 12))
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(lambda sn: env.apply([sn], now=L(20, 12, 1)), [s1, s2] * 8))
+        check("Правка и устаревший снимок вперемешку → итог = версия после правки (3 матча)",
+              len(env.sched()) == 3 and all(i in [p.id for p in env.sched()] for i in ids_once))
+        st = env.apply([s1], now=L(20, 12, 2))
+        check("Устаревший снимок (до правки) игнорируется и не затирает свежие данные",
+              st["outdated_event"] == 1 and len(env.sched()) == 3)
+    with _Env() as env:
+        # перечит и событие on_message одновременно на одной и той же версии
+        s1 = snap(31, L(20, 11), v1)
+        errs = []
+
+        def run(kind):
+            try:
+                env.apply([s1], now=L(20, 11, 1), full_scan=(kind == "recheck"), scan_floor=datetime.min)
+            except Exception as e:
+                errs.append(e)
+        ts = [threading.Thread(target=run, args=(k,)) for k in ["recheck", "event"] * 6]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        check("Перечит и on_message параллельно: без ошибок и дублей", not errs and len(env.sched()) == 2)
+
+
+def test_midnight_flow():
+    print("\n[Переход через полночь на уровне расписания]")
+    with _Env() as env:
+        content = "\n".join([M("23:30", "А", "Б"), M("00:30", "В", "Г"), M("03:00", "Д", "Е"), M("12:00", "Ж", "З")])
+        env.apply([snap(40, L(20, 23, 10), content)], now=L(20, 23, 11))
+        check("Пост 20.10 23:10: 23:30 сегодня; 00:30, 03:00, 12:00 — уже 21.10",
+              env.times() == ["20 23:30", "21 00:30", "21 03:00", "21 12:00"])
+        env.apply([snap(40, L(20, 23, 10), content)], now=L(21, 0, 5))
+        check("После полуночи те же записи на тех же датах (ничего не «сдвинулось на сегодня»)",
+              env.times() == ["20 23:30", "21 00:30", "21 03:00", "21 12:00"])
+    with _Env() as env:
+        # первое чтение после полуночи: пост вчерашний, дата считается от публикации
+        content = M("23:30", "А", "Б") + "\n" + M("12:00", "Ж", "З")
+        st = env.apply([snap(41, L(20, 23, 10), content)], now=L(21, 0, 30))
+        check("Бот поднялся в 00:30 и читает пост 23:10: 23:30 прошёл, 12:00 — 21.10",
+              env.times() == ["21 12:00"] and st["skipped_stale"] == 1)
+
+
 if __name__ == "__main__":
     print("=" * 50)
     print("ТЕСТЫ BET BOT")
@@ -693,6 +1141,20 @@ if __name__ == "__main__":
     test_settings_migration()
     test_live_message()
     test_voice()
+    test_match_dates_rules()
+    test_date_headers_parser()
+    test_scenario_a_yesterday_message()
+    test_scenario_b_evening_for_tomorrow()
+    test_scenario_c_edit_adds_matches()
+    test_repeat_edit_no_changes()
+    test_time_change_of_known_match()
+    test_match_identity_stable()
+    test_multiple_dates_in_one_message()
+    test_undetermined_date()
+    test_restart_reprocessing()
+    test_legacy_and_removals()
+    test_concurrent_events()
+    test_midnight_flow()
 
     print("\n" + "=" * 50)
     print(f"Пройдено: {_passed}  |  Провалено: {_failed}")

@@ -1,7 +1,9 @@
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from models import Prediction
+from match_dates import DateHint, resolve_match_datetime
 
 # Триггеры начала нового прогноза (старый формат)
 TRIGGERS = ("футбол.", "soccer.", "футбол ", "soccer ")
@@ -83,6 +85,125 @@ def parse_predictions(text: str, tz_offset: int = 3, source: str = "manual") -> 
     с заглавных букв, как и заголовок) можно было спутать с началом следующего
     блока, и парсер обрезал прогноз посередине, склеивая хвост со следующим.
     """
+    predictions = []
+    for block, hint in split_blocks(text):
+        pred = _parse_one(block, tz_offset, source, hint)
+        if pred:
+            predictions.append(pred)
+
+    return predictions
+
+
+@dataclass
+class RawMatch:
+    """Прогноз из текста БЕЗ даты: только время и (если есть) явная подсказка даты."""
+    text: str
+    hour: int
+    minute: int
+    hint: Optional[DateHint] = None
+
+
+def extract_raw_matches(text: str) -> list[RawMatch]:
+    """
+    Тот же разбор на блоки, что и в parse_predictions, но дата матча НЕ
+    выбирается — её определяет match_dates по моменту появления матча в
+    сообщении (см. storage.apply_discord_messages).
+    """
+    out = []
+    for block, hint in split_blocks(text):
+        t = block.strip().rstrip('.')
+        found = _find_time(t)
+        if not found:
+            continue
+        hour, minute, _m = found
+        out.append(RawMatch(text=t, hour=hour, minute=minute, hint=hint))
+    return out
+
+
+# ── Явные даты в тексте ──────────────────────────────────────────────────────
+
+_MONTH_BY_PREFIX = {
+    "янв": 1, "фев": 2, "мар": 3, "апр": 4, "мая": 5, "июн": 6,
+    "июл": 7, "авг": 8, "сен": 9, "окт": 10, "ноя": 11, "дек": 12,
+}
+_REL_WORDS = {"сегодня": 0, "завтра": 1, "послезавтра": 2}
+
+# Числовая дата 21.10 / 21.10.2026 / 21.10.26. Обе части — ровно по 2 цифры и
+# без соседних цифр/точек/запятых/дефисов: коэффициенты («2.5», «1.85», «10.50»)
+# и время («18-00», «18:00») под неё не попадают.
+_NUM_DATE = re.compile(r'(?<![\d.,:/\-])(\d{2})\.(\d{2})(?:\.(\d{4}|\d{2}))?(?![\d.,:/\-])')
+# «21 октября», «21 окт.»
+_WORD_DATE = re.compile(r'(?<![\d.,:/\-])(\d{1,2})\s+([а-яё]{3,9})\.?(?![а-яё])', re.IGNORECASE)
+_REL_DATE = re.compile(r'(?<![а-яё])(сегодня|завтра|послезавтра)(?![а-яё])', re.IGNORECASE)
+
+_WEEKDAYS = re.compile(
+    r'\b(?:понедельник|вторник|сред[ауы]|четверг|пятниц[ауы]|суббот[ауы]|воскресенье|пн|вт|ср|чт|пт|сб|вс)\b'
+)
+_HEADER_FILLER = re.compile(r'\b(?:на|прогнозы|прогноз|матчи|расписание|экспрессы|экспресс|за|числа|г)\b')
+
+
+def _make_hint(day: int, month: int, year_s: Optional[str]) -> Optional[DateHint]:
+    if not (1 <= day <= 31 and 1 <= month <= 12):
+        return None
+    year = None
+    if year_s:
+        year = int(year_s) + (2000 if len(year_s) == 2 else 0)
+    return DateHint(day=day, month=month, year=year)
+
+
+def _find_date_hint(text: str) -> Optional[DateHint]:
+    """Явная дата в произвольном фрагменте (числовая, «21 октября» или сегодня/завтра)."""
+    m = _NUM_DATE.search(text)
+    if m:
+        h = _make_hint(int(m.group(1)), int(m.group(2)), m.group(3))
+        if h:
+            return h
+    for m in _WORD_DATE.finditer(text):
+        month = _MONTH_BY_PREFIX.get(m.group(2).lower()[:3])
+        if month:
+            h = _make_hint(int(m.group(1)), month, None)
+            if h:
+                return h
+    m = _REL_DATE.search(text)
+    if m:
+        return DateHint(rel_days=_REL_WORDS[m.group(1).lower()])
+    return None
+
+
+def _parse_date_header(line: str) -> Optional[DateHint]:
+    """
+    Строка, состоящая ТОЛЬКО из даты («21.10», «Вторник, 21 октября», «Завтра»,
+    «Прогнозы на 21.10») — заголовок секции: все прогнозы ниже (до следующего
+    такого заголовка) относятся к этой дате. Любая строка с командами, временем
+    или лигой заголовком не считается.
+    """
+    t = line.lower().replace('ё', 'е')
+    t = _WEEKDAYS.sub(' ', t)
+    t = _HEADER_FILLER.sub(' ', t)
+    t = re.sub(r'[\W_]+', lambda m: '.' if m.group(0).strip(' ').strip('_') == '.' else ' ', t)
+    t = re.sub(r'\s+', ' ', t).strip(' .')
+    if not t:
+        return None
+    # то, что осталось, должно целиком быть датой
+    if _NUM_DATE.fullmatch(t) or re.fullmatch(r'\d{2}\.\d{2}\.\d{4}|\d{2}\.\d{2}\.\d{2}', t):
+        return _find_date_hint(t)
+    wm = re.fullmatch(r'(\d{1,2}) ([а-я]{3,9})(?: \d{4})?', t)
+    if wm and _MONTH_BY_PREFIX.get(wm.group(2)[:3]):
+        return _find_date_hint(t)
+    if t in _REL_WORDS:
+        return DateHint(rel_days=_REL_WORDS[t])
+    return None
+
+
+def split_blocks(text: str) -> list[tuple[str, Optional[DateHint]]]:
+    """
+    Текст сообщения → список (блок прогноза, явная дата или None).
+
+    Дата берётся из строки-заголовка секции («21.10», «Завтра»…) либо из самого
+    прогноза до времени («… 21.10 18-00 …»); вторая приоритетнее. Строки-заголовки
+    в текст прогнозов не попадают. Если дат в тексте нет — результат ровно тот же,
+    что был у прежнего разбора.
+    """
     normalized = text.replace('\r\n', '\n').replace('\r', '\n')
 
     # Заменяем разделитель из тире на одинаковый маркер (общее для обоих форматов)
@@ -91,25 +212,36 @@ def parse_predictions(text: str, tz_offset: int = 3, source: str = "manual") -> 
     if not normalized.strip():
         return []
 
-    # Для определения формата (старый/новый) достаточно взглянуть на текст в целом
-    flat_probe = re.sub(r'\s+', ' ', normalized).strip()
-    is_old_format = bool(_OLD_FORMAT_TRIGGER.match(flat_probe))
-
     lines = [ln.strip() for ln in normalized.split('\n')]
     lines = [ln for ln in lines if ln]  # убираем пустые строки
 
-    if is_old_format:
-        parts = _split_old_format(lines)
-    else:
-        parts = _split_new_format(lines)
+    # Секции по заголовкам-датам
+    segments: list[tuple[Optional[DateHint], list[str]]] = []
+    cur_hint: Optional[DateHint] = None
+    cur: list[str] = []
+    for ln in lines:
+        h = _parse_date_header(ln)
+        if h is not None:
+            if cur:
+                segments.append((cur_hint, cur))
+            cur_hint, cur = h, []
+        else:
+            cur.append(ln)
+    if cur:
+        segments.append((cur_hint, cur))
 
-    predictions = []
-    for part in parts:
-        pred = _parse_one(part, tz_offset, source)
-        if pred:
-            predictions.append(pred)
+    # Формат (старый/новый) определяем по всему тексту без строк-заголовков
+    flat_probe = re.sub(r'\s+', ' ', ' '.join(ln for _h, seg in segments for ln in seg)).strip()
+    is_old_format = bool(_OLD_FORMAT_TRIGGER.match(flat_probe))
 
-    return predictions
+    result: list[tuple[str, Optional[DateHint]]] = []
+    for hint, seg_lines in segments:
+        parts = _split_old_format(seg_lines) if is_old_format else _split_new_format(seg_lines)
+        for part in parts:
+            found = _find_time(part.strip().rstrip('.'))
+            inline = _find_date_hint(part[:found[2].start()]) if found else None
+            result.append((part, inline or hint))
+    return result
 
 
 _OLD_FORMAT_LINE_START = re.compile(r'(?i)^(?:футбол|soccer)[\.\s]')
@@ -283,22 +415,36 @@ def _block_is_closed(current: list[str]) -> bool:
     return has_time and has_teams
 
 
-def _parse_one(text: str, tz_offset: int, source: str) -> Optional[Prediction]:
+def _find_time(text: str):
+    """Первое валидное время (18-00, 19:00, 2-30) → (hour, minute, match) или None."""
+    for m in re.finditer(r'\b(\d{1,2})[-:](\d{2})\b', text):
+        h, mn = int(m.group(1)), int(m.group(2))
+        if 0 <= h <= 23 and 0 <= mn <= 59:
+            return h, mn, m
+    return None
+
+
+def _parse_one(text: str, tz_offset: int, source: str,
+               hint: Optional[DateHint] = None) -> Optional[Prediction]:
     """Парсит одну строку прогноза. Время обязательно."""
     text = text.strip().rstrip('.')
 
     # Ищем первое валидное время: 18-00, 19:00, 2-30
-    hour = minute = None
-    time_pos = None
-    for m in re.finditer(r'\b(\d{1,2})[-:](\d{2})\b', text):
-        h, mn = int(m.group(1)), int(m.group(2))
-        if 0 <= h <= 23 and 0 <= mn <= 59:
-            hour, minute = h, mn
-            time_pos = m
-            break
-
-    if hour is None:
+    found = _find_time(text)
+    if found is None:
         return None
+    hour, minute, _time_m = found
+
+    utc_now = datetime.utcnow()
+
+    # В тексте есть явная дата — используем её (относительные «завтра» — от сегодня)
+    if hint is not None:
+        res = resolve_match_datetime(hour, minute, hint, utc_now, tz_offset)
+        if res.dt is None:
+            return None
+        if source == "discord" and res.dt < utc_now - timedelta(minutes=2):
+            return None
+        return Prediction(text=text, match_time=res.dt, source=source, date_basis=res.basis)
 
     # Конвертация локального времени → UTC
     user_tz = timezone(timedelta(hours=tz_offset))
@@ -317,8 +463,10 @@ def _parse_one(text: str, tz_offset: int, source: str) -> Optional[Prediction]:
     #   чтобы старые прогнозы из неубранного DC-канала не засоряли список.
     # - source="manual" (ручной /add): НЕ игнорируем — пользователь знает что делает.
     #   Только ночные матчи переносим на завтра.
-    utc_now = datetime.utcnow()
-
+    # ВАЖНО: Discord-слушатель этот путь больше не использует — там дата матча
+    # определяется по моменту публикации/правки сообщения (extract_raw_matches +
+    # match_dates), а «сегодня на момент парсинга» давало ровно баг со вчерашними
+    # сообщениями. Ветка discord оставлена для совместимости.
     if match_time_utc < utc_now - timedelta(minutes=2):
         is_night_match = hour < 6
         is_evening_now = local_now.hour >= 18
