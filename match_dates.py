@@ -43,6 +43,27 @@ SAME_DAY_GRACE_MIN = 15
 # запас нужен только для явных дат вперёд).
 HISTORY_HORIZON_HOURS = 72
 
+# Мониторинг Фонбета после старта матча (лайв). Раньше окно было «20 минут» только
+# на словах: планировщик напоминаний удалял прогноз через DELETE_AFTER_MINUTES (по
+# умолчанию 5), и мониторинг обрывался. Теперь прогноз гарантированно живёт в
+# расписании, пока идёт мониторинг: чистка и «уже прошёл» (storage) считаются от
+# одного и того же значения — retention_minutes().
+MONITOR_AFTER_START_MIN = 15
+
+
+def retention_minutes(configured) -> int:
+    """
+    Сколько минут после старта матч остаётся в расписании: не меньше окна мониторинга
+    (+1 минута запаса, чтобы последний тик мониторинга успел до чистки).
+    DELETE_AFTER_MINUTES из окружения может только увеличить это значение.
+    """
+    try:
+        configured = int(configured)
+    except (TypeError, ValueError):
+        configured = 0
+    return max(configured, MONITOR_AFTER_START_MIN + 1)
+
+
 # Основания (basis) — пишутся в лог, в Prediction.date_basis и в реестр
 BASIS_EXPLICIT = "explicit"
 BASIS_SAME_DAY = "anchor:same-day"

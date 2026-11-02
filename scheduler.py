@@ -9,6 +9,7 @@ import storage
 import config
 import auth
 from parser import format_reminder
+from match_dates import MONITOR_AFTER_START_MIN, retention_minutes
 from fonbet import (
     fetch_events, find_matching_event, extract_teams_from_prediction,
     check_crookedness, check_close_match, build_match_url, format_bet_odds,
@@ -21,9 +22,11 @@ import asyncio
 logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler()
 
-# Окно мониторинга Фонбета: за час до старта → +20 мин после старта
+# Окно мониторинга Фонбета: за час до старта → +15 мин после старта.
+# «После старта» теперь действительно 15 минут: прогноз не удаляется из расписания,
+# пока окно не закончится (см. retention_minutes ниже и в storage).
 FONBET_WINDOW_BEFORE_MIN = 60
-FONBET_WINDOW_AFTER_MIN  = 20
+FONBET_WINDOW_AFTER_MIN  = MONITOR_AFTER_START_MIN
 
 # «Горячее» окно — частые проверки (10 мин до старта → 10 мин после)
 HOT_WINDOW_BEFORE_MIN = 10
@@ -70,7 +73,9 @@ def setup_scheduler(app: Application):
 
 async def notification_tick(app: Application):
     now = datetime.utcnow()
-    cutoff = now - timedelta(minutes=config.DELETE_AFTER_MINUTES)
+    # Не раньше конца окна мониторинга: иначе прогноз исчезал через DELETE_AFTER_MINUTES
+    # (5 мин) и лайв-уведомление уже не могло прийти.
+    cutoff = now - timedelta(minutes=retention_minutes(config.DELETE_AFTER_MINUTES))
 
     predictions = storage.load_predictions()
     if not predictions:

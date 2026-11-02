@@ -8,6 +8,7 @@
 - извлечение команд
 - парсинг ставок (победитель/фора)
 - логику кривизны (СЛУЧАЙ 1/2/3)
+- матчинг с Фонбетом: пороги 60/50, «тот же слот» (время + страна/лига), окно мониторинга
 - даты матчей из Discord-сообщений (публикация/правка/полночь/дубли/гонки) — с контролируемым временем
 """
 import sys
@@ -1122,6 +1123,125 @@ def test_midnight_flow():
               env.times() == ["21 12:00"] and st["skipped_stale"] == 1)
 
 
+# ── Матчинг прогноза с событием Фонбета: пороги и «тот же слот» ───────────────
+
+def _ts(dt):
+    return int((dt - datetime(1970, 1, 1)).total_seconds())
+
+
+def _ev(t1, t2, start, league="Poland. 4 Liga. Warmia", live=False, eid=1):
+    return {"id": eid, "team1": t1, "team2": t2, "start_time": _ts(start), "is_live": live,
+            "live_reason": "line", "league_name": league, "odd_p1": 2.0, "odd_p2": 3.0, "factors": []}
+
+
+def test_fonbet_matching_tiers():
+    print("\n[Фонбет: пороги совпадения и «тот же слот»]")
+    # В тестовом окружении token_sort_ratio = доля общих слов (Jaccard) → проценты считаются точно
+    start = L(20, 16)                                     # матч в 16:00 МСК
+    pred = "Poland. 4 Liga. Warmia 16-00 alpha beta gamma — delta epsilon zeta п1 2+"
+    find = fonbet.find_matching_event
+
+    check("Базовый порог понижен 80 → 60", fonbet.FUZZY_THRESHOLD == 60)
+    check("Порог «того же слота» = 50", fonbet.FUZZY_THRESHOLD_SAME_SLOT == 50)
+
+    # 66% — раньше (порог 80) не находился, теперь base
+    ev66 = _ev("alpha beta", "delta epsilon", start, league=None)
+    r = find(pred, [ev66], expected_utc=start)
+    check("Совпадение 66% (раньше не находилось) → найдено как base, лига не нужна",
+          r is not None and r["match_tier"] == "base" and r["match_score"] == 66)
+
+    # 50%: два слова из трёх у каждой команды (2/4)
+    ev50 = _ev("alpha beta kappa", "delta epsilon omega", start)
+    r = find(pred, [ev50], expected_utc=start)
+    check("50% + то же время + та же страна/лига → найдено (same_slot)",
+          r is not None and r["match_tier"] == "same_slot" and r["match_score"] == 50)
+    check("Оригинальное событие не мутируется (возвращается копия)", "match_tier" not in ev50)
+
+    check("50%, но другая лига → не найдено",
+          find(pred, [_ev("alpha beta kappa", "delta epsilon omega", start, league="Poland. Ekstraklasa")],
+               expected_utc=start) is None)
+    check("50%, но другая страна → не найдено",
+          find(pred, [_ev("alpha beta kappa", "delta epsilon omega", start, league="Germany. 4 Liga. Warmia")],
+               expected_utc=start) is None)
+    check("50%, лига неизвестна (нет справочника sports) → не найдено, как раньше",
+          find(pred, [_ev("alpha beta kappa", "delta epsilon omega", start, league=None)], expected_utc=start) is None)
+    check("50%, время старта отличается на 30 мин → не найдено",
+          find(pred, [_ev("alpha beta kappa", "delta epsilon omega", start + timedelta(minutes=30))],
+               expected_utc=start) is None)
+    check("50%, но времени прогноза нет (expected_utc=None) → пониженный порог не работает",
+          find(pred, [ev50], expected_utc=None) is None)
+    check("Ниже 50% → не найдено даже в той же лиге и в то же время",
+          find(pred, [_ev("alpha kappa lambda", "delta sigma omega", start)], expected_utc=start) is None)
+    check("Возрастной маркер всё ещё обязателен: прогноз (20) ≠ событие основы",
+          find("Poland. 4 Liga. Warmia 16-00 alpha beta gamma (20) — delta epsilon zeta (20) п1 2+",
+               [ev50], expected_utc=start) is None)
+
+    # Много матчей в одном слоте
+    other_far = _ev("kappa lambda", "sigma omega", start, eid=2)
+    r = find(pred, [other_far, ev50], expected_utc=start)
+    check("В слоте несколько матчей, наш явно ближе → найден правильный", r is not None and r["id"] == 1)
+    twin = _ev("alpha beta lambda", "delta epsilon sigma", start, eid=3)
+    check("Два одинаково похожих кандидата в том же слоте → неоднозначно, не найдено",
+          find(pred, [ev50, twin], expected_utc=start) is None)
+    check("Неоднозначность не мешает обычному (base) совпадению",
+          (find(pred, [ev66, twin], expected_utc=start) or {}).get("match_tier") == "base")
+
+    # Прежнее поведение при высоком совпадении
+    ev100 = _ev("alpha beta gamma", "delta epsilon zeta", start, league=None)
+    check("100% совпадение → base", (find(pred, [ev100], expected_utc=start) or {}).get("match_tier") == "base")
+    check("Команды в обратном порядке тоже находятся",
+          find(pred, [_ev("delta epsilon zeta", "alpha beta gamma", start, league=None)], expected_utc=start) is not None)
+
+
+def test_league_detection():
+    print("\n[Фонбет: страна и лига события]")
+    lm = fonbet.league_matches
+    check("Страна+лига+подлига совпадают", lm("Poland. 4 Liga. Warmia-Masuria Voivodeship 16-00 A — B",
+                                              "Poland. 4 Liga. Warmia-Masuria Voivodeship"))
+    check("На Фонбете короче («Poland. 4 Liga»), в прогнозе — с подлигой", lm(
+        "Poland. 4 Liga. Warmia-Masuria Voivodeship 16-00 A — B", "Poland. 4 Liga"))
+    check("Префикс «Футбол.» в прогнозе не мешает", lm("Футбол. Poland. 4 Liga. 16-00 A — B", "Poland. 4 Liga"))
+    check("Только страна в прогнозе — достаточно страны", lm("Belarus. 18-00 A — B", "Belarus. Second League"))
+    check("Другая лига той же страны — нет", not lm("Poland. 4 Liga. 16-00 A — B", "Poland. Ekstraklasa"))
+    check("Другая страна — нет", not lm("Poland. 4 Liga. 16-00 A — B", "Germany. 4 Liga"))
+    check("Название лиги неизвестно — нет", not lm("Poland. 4 Liga. 16-00 A — B", None))
+    check("Разные алфавиты (прогноз «Нигерия», лига «Nigeria») не сопоставляются",
+          not lm("Футбол. Нигерия. Кубок. 18-00 А — Б", "Nigeria. Cup"))
+    check("Скобки в названии страны", lm("Myanmar (Burma). Youth League U20 15-00 A — B", "Myanmar (Burma). Youth League U20"))
+
+    data = {"sports": [
+        {"id": 1, "name": "Football", "kind": "sport"},
+        {"id": 10, "parentId": 1, "name": "Poland"},
+        {"id": 11, "parentId": 10, "name": "4 Liga"},
+        {"id": 20, "parentId": 1, "name": "England"},
+        {"id": 21, "parentId": 20, "name": "England. Premier League"},
+    ]}
+    names = fonbet._build_league_names(data)
+    check("Справочник sports: «Страна. Лига» собирается по цепочке parentId, корень «Football» отброшен",
+          names[11] == "Poland. 4 Liga")
+    check("Дублирующийся префикс не повторяется", names[21] == "England. Premier League")
+    check("Нет справочника sports → пусто (работает только базовый порог)", fonbet._build_league_names({"events": []}) == {})
+
+
+def test_monitor_window_retention():
+    print("\n[Окно мониторинга: прогноз живёт ≥ 15 минут после старта]")
+    rm = match_dates.retention_minutes
+    check("DELETE_AFTER_MINUTES=5 → прогноз живёт 16 мин (окно 15 + запас)", rm(5) == 16)
+    check("Не задано/мусор → тот же минимум", rm(None) == 16 and rm("abc") == 16)
+    check("Большее значение из окружения сохраняется", rm(30) == 30)
+    check("Окно мониторинга планировщика = 15 мин", scheduler.FONBET_WINDOW_AFTER_MIN == 15)
+    check("Дедлайн ожидания кэфов в лайве укладывается в срок жизни прогноза",
+          scheduler.FONBET_WINDOW_AFTER_MIN - 5 < rm(5) and 10 < rm(5))
+
+    content = M("14:00", "А", "Б")
+    with _Env() as env:
+        env.apply([snap(60, L(20, 11), content)], now=L(20, 14, 10))
+        check("Матч начался 10 мин назад — ещё в расписании (раньше срезался на 5-й минуте)", env.times() == ["20 14:00"])
+    with _Env() as env:
+        st = env.apply([snap(61, L(20, 11), content)], now=L(20, 14, 17))
+        check("Матч начался 17 мин назад — уже за окном, не добавляется", env.times() == [] and st["skipped_stale"] == 1)
+
+
 if __name__ == "__main__":
     print("=" * 50)
     print("ТЕСТЫ BET BOT")
@@ -1155,6 +1275,9 @@ if __name__ == "__main__":
     test_legacy_and_removals()
     test_concurrent_events()
     test_midnight_flow()
+    test_fonbet_matching_tiers()
+    test_league_detection()
+    test_monitor_window_retention()
 
     print("\n" + "=" * 50)
     print(f"Пройдено: {_passed}  |  Провалено: {_failed}")

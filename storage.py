@@ -16,7 +16,7 @@ from models import Prediction, UserSettings
 import config
 import gist_storage
 import match_dates
-from match_dates import resolve_match_datetime, to_local
+from match_dates import resolve_match_datetime, to_local, retention_minutes
 from parser import extract_raw_matches
 
 logger = logging.getLogger(__name__)
@@ -259,7 +259,7 @@ class _DiscordPass:
         self.ledger: dict = ledger
         self.now: datetime = now
         self.tz: int = tz
-        self.cutoff = now - timedelta(minutes=getattr(config, "DELETE_AFTER_MINUTES", 5))
+        self.cutoff = now - timedelta(minutes=retention_minutes(getattr(config, "DELETE_AFTER_MINUTES", 5)))
         self.added_preds: list[Prediction] = []
         self._tk_cache: dict[str, str] = {}
         self.stats = {

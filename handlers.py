@@ -556,7 +556,9 @@ async def cmd_checkfonbet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 lines.append(
                     f"\n✅ {status}{odds}\n"
                     f"   Прогноз: {team1} — {team2}\n"
-                    f"   Fonbet: {event['team1']} — {event['team2']}"
+                    f"   Fonbet: {event['team1']} — {event['team2']}\n"
+                    f"   Совпадение: {event.get('match_score')}% [{event.get('match_tier')}]"
+                    f" · лига: {event.get('league_name') or 'неизвестна'}"
                 )
             else:
                 lines.append(f"\n❌ Не найден: {team1} — {team2}")
