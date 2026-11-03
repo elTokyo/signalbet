@@ -21,7 +21,8 @@ import aiohttp
 import storage
 import config
 from parser import format_time_local, display_text_without_time
-from match_dates import can_still_matter
+from match_dates import can_still_matter, to_local
+import health
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,39 @@ async def _apply_and_notify(snapshots: list[dict], label: str, **kwargs) -> dict
     added = stats.get("added_preds", [])
     if added:
         await _notify_added(added, label)
+    undetermined = stats.get("undetermined_new") or []
+    if undetermined:
+        await _ask_admins_undetermined(undetermined)
     return stats
+
+
+MAX_UNDETERMINED_ASKS = 6   # не больше стольких вопросов за один проход, остальное — в /undetermined
+
+
+async def _ask_admins_undetermined(items: list[dict]):
+    """
+    Матч, дату которого бот не смог определить достоверно, не пропадает молча:
+    админам уходит вопрос «Сегодня / Завтра / Пропустить». Ответ обрабатывает
+    handlers.on_action_callback (storage.resolve_undetermined). Спрашиваем один раз на матч.
+    """
+    admins = list(config.ADMIN_CHAT_IDS)
+    if not admins:
+        return
+    now = datetime.utcnow()
+    for item in items[:MAX_UNDETERMINED_ASKS]:
+        created = item.get("created")
+        when = f"{to_local(created, config.DEFAULT_TZ_OFFSET):%d.%m %H:%M}" if created else "?"
+        text = (
+            f"❓ Не удалось определить дату матча\n\n"
+            f"{item['text'][:300]}\n\n"
+            f"Сообщение в Discord от {when}. {item['reason']}.\n\n"
+            f"Когда он играет?"
+        )
+        btns = storage.ud_buttons(item, now)
+        await _send_tg(admins, text, buttons=[btns[:2], btns[2:]])
+    rest = len(items) - MAX_UNDETERMINED_ASKS
+    if rest > 0:
+        await _send_tg(admins, f"❓ Ещё матчей без даты: {rest}. Список с кнопками: /undetermined")
 
 
 def trigger_manual_recheck() -> tuple[bool, str]:
@@ -131,6 +164,7 @@ async def _manual_recheck(label: str = "автопроверка") -> dict:
     stats = await _apply_and_notify(
         snapshots, label, full_scan=True, scan_floor=scan_floor,
     )
+    health.discord_sync(True, stats)    # перечит прошёл — для /status и сторожа
     return {"messages": len(snapshots), **stats}
 
 
@@ -181,7 +215,7 @@ async def _notify_added(preds: list, label: str):
         logger.error(f"Discord broadcast error: {e}")
 
 
-async def _send_tg(recipients: list[int], text: str) -> int:
+async def _send_tg(recipients: list[int], text: str, buttons: list = None) -> int:
     """
     Отправка простого текста списку чатов через HTTP API Telegram.
     Возвращает число реально доставленных. Раньше HTTP-статус не проверялся:
@@ -191,13 +225,19 @@ async def _send_tg(recipients: list[int], text: str) -> int:
     if not recipients:
         return 0
     delivered = 0
+    payload_extra = {}
+    if buttons:
+        # buttons: [[(подпись, callback_data), ...], ...] — рядами
+        payload_extra["reply_markup"] = {"inline_keyboard": [
+            [{"text": label, "callback_data": data} for label, data in row] for row in buttons
+        ]}
     try:
         async with aiohttp.ClientSession() as session:
             for chat_id in recipients:
                 try:
                     async with session.post(
                         f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendMessage",
-                        json={"chat_id": chat_id, "text": text},
+                        json={"chat_id": chat_id, "text": text, **payload_extra},
                     ) as resp:
                         if resp.status == 200:
                             delivered += 1
@@ -451,13 +491,17 @@ def run_discord_listener():
                 )
             except Exception as e:
                 logger.error(f"Periodic recheck error: {e}")
+                health.discord_sync(False, error=str(e)[:120])
 
     # ── События ──────────────────────────────────────────────────────────────
+    health.discord_enabled(True)
+
     @client.event
     async def on_ready():
         global _client_ref, _loop_ref
         _client_ref = client
         _loop_ref = client.loop
+        health.discord_connected(True)
         logger.info(f"Discord listener запущен: {client.user}")
         ch = client.get_channel(config.DISCORD_CHANNEL_ID)
         if ch:
@@ -486,6 +530,14 @@ def run_discord_listener():
         else:
             logger.info("Слежение за войсом выключено (нет DISCORD_VOICE_* переменных)")
         client.loop.create_task(periodic_recheck())
+
+    @client.event
+    async def on_disconnect():
+        health.discord_connected(False)
+
+    @client.event
+    async def on_resumed():
+        health.discord_connected(True)
 
     @client.event
     async def on_voice_state_update(member, before, after):

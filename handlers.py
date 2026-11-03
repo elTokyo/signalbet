@@ -1,4 +1,7 @@
+import asyncio
 import logging
+import time
+from datetime import datetime, timedelta
 from functools import wraps
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
@@ -6,6 +9,8 @@ from telegram.ext import ContextTypes
 import storage
 import auth
 import config
+import health
+import userprefs
 from parser import parse_predictions, format_time_local, display_text_without_time
 
 logger = logging.getLogger(__name__)
@@ -88,23 +93,116 @@ async def _send_help(update: Update, user_id: int):
             "/delete <id> — удалить один\n"
             "/clear — очистить все\n"
             "/settings — настройки\n"
+            "/today — матчи на сегодня со статусом\n"
+            "/quiet, /block, /unblock, /unmute — личные фильтры\n"
             "/broadcast — рассылка всем\n\n"
+            "🩺 *Диагностика:*\n"
+            "/status — здоровье бота (Фонбет, Discord)\n"
+            "/misses — почему матч не нашёлся на Фонбете\n"
+            "/undetermined — матчи с неопределённой датой\n"
+            "/aliases, /unalias — запомненные названия команд\n\n"
             "👥 *Управление пользователями:*\n"
             "/users, /ban, /unban, /remove\n\n"
             "🔔 Уведомления за 30 и 5 минут до матча.\n"
-            "🗑 Автоудаление через 5 минут после старта."
+            "🗑 Матч уходит из списка после окна мониторинга (~16 мин после старта).\n\n"
+            "Полный список команд: /commands"
         )
     else:
         text = (
             "⚽ *Бот-помощник для прогнозов*\n\n"
             "📋 *Доступные команды:*\n"
             "/list — посмотреть активные прогнозы\n"
+            "/today — матчи на сегодня и что с ними на Фонбете\n"
             "/settings — твои настройки (часовой пояс, уведомления)\n"
+            "/quiet 23 8 — тихие часы (не беспокоить с 23 до 8), `/quiet off` — выключить\n"
+            "/block Poland — не получать матчи страны (`/unblock`, список — `/block`)\n"
+            "/unmute — вернуть заглушённые матчи\n"
             "/feedback — сообщить о баге или оставить отзыв\n\n"
-            "🔔 Уведомления о матчах ты получаешь автоматически.\n\n"
+            "🔔 Уведомления о матчах ты получаешь автоматически.\n"
+            "Полный список команд: /commands\n\n"
             "_Добавление и редактирование прогнозов доступно только админам._"
         )
     await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ── /commands: единый реестр всех команд ─────────────────────────────────────
+# Единственный источник правды для списка команд. Тест в test_bot.py сверяет его с
+# CommandHandler-ами в bot.py: добавил команду в bot.py, но забыл сюда — тест упадёт.
+# (имя без «/», аргументы, описание)
+
+COMMANDS_USER = [
+    ("start",    "",                    "начало работы / ввод пароля"),
+    ("commands", "",                    "этот список (работает и /comands)"),
+    ("list",     "",                    "активные прогнозы"),
+    ("today",    "",                    "матчи на сегодня и статус каждого на Фонбете"),
+    ("settings", "",                    "часовой пояс и категории уведомлений"),
+    ("quiet",    "23 8 | off",          "тихие часы: не беспокоить в этот интервал"),
+    ("block",    "<страна>",            "не получать матчи страны (без аргумента — список)"),
+    ("unblock",  "<страна>",            "снова получать матчи страны"),
+    ("unmute",   "",                    "вернуть заглушённые матчи"),
+    ("feedback", "",                    "отправить отзыв или баг-репорт админу"),
+    ("cancel",   "",                    "отменить текущий ввод"),
+]
+
+COMMANDS_ADMIN = [
+    ("📝 Прогнозы", [
+        ("add",       "",                 "добавить прогнозы"),
+        ("delete",    "<id>",             "удалить один прогноз"),
+        ("clear",     "",                 "очистить все прогнозы"),
+        ("broadcast", "",                 "рассылка всем пользователям"),
+    ]),
+    ("👥 Пользователи", [
+        ("users",  "",             "список авторизованных"),
+        ("ban",    "<id>",         "заблокировать пользователя"),
+        ("unban",  "<id>",         "разблокировать"),
+        ("remove", "<id>",         "удалить из whitelist"),
+    ]),
+    ("🩺 Диагностика", [
+        ("status",       "",                "здоровье бота: Фонбет, Discord, расписание, тревоги"),
+        ("misses",       "[N] | found",     "почему матчи не нашлись на Фонбете / что нашлось"),
+        ("undetermined", "",                "матчи с неопределённой датой (кнопки выбора)"),
+        ("checkfonbet",  "",                "сопоставление прогнозов с Фонбетом: линия/лайв, % совпадения"),
+        ("factors",      "[N]",             "дамп всех рынков матча (для кодов форовых рынков)"),
+        ("bk",           "[N]",             "проверить прогноз №N на BetBoom / Winline / Лиге Ставок"),
+        ("aliases",      "",                "запомненные пары названий команд"),
+        ("unalias",      "<название>",      "удалить ошибочную пару названий"),
+        ("syncdiscord",  "",                "принудительный перечит Discord-канала"),
+        ("voice",        "",                "диагностика слежения за голосовым каналом Discord"),
+        ("debug",        "",                "диагностика конфигурации"),
+    ]),
+]
+
+
+def all_command_names() -> set:
+    """Имена всех команд из реестра (для теста сверки с bot.py)."""
+    names = {c[0] for c in COMMANDS_USER}
+    for _title, items in COMMANDS_ADMIN:
+        names |= {c[0] for c in items}
+    return names
+
+
+def _fmt_command(name: str, args: str, desc: str) -> str:
+    return f"/{name}{' ' + args if args else ''} — {desc}"
+
+
+def build_commands_text(is_admin: bool) -> str:
+    """Текст для /commands. Простой текст без Markdown: «<id>» и «|» в нём ломали бы разметку."""
+    lines = ["📋 Все команды бота\n", "👤 Для всех:"]
+    lines += [_fmt_command(*c) for c in COMMANDS_USER]
+    if is_admin:
+        for title, items in COMMANDS_ADMIN:
+            lines += ["", f"{title}:"]
+            lines += [_fmt_command(*c) for c in items]
+    else:
+        lines += ["", "🔒 Админские команды (управление прогнозами и пользователями, диагностика) "
+                      "скрыты — они доступны только админам."]
+    return "\n".join(lines)
+
+
+@require_auth
+async def cmd_commands(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Выдаёт список всех команд (админам — с админскими). Также доступна как /comands."""
+    await update.message.reply_text(build_commands_text(auth.is_admin(update.effective_user.id)))
 
 
 # ── Команды чтения (доступны всем авторизованным) ────────────────────────────
@@ -895,6 +993,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if (q.data or "").startswith(("mute|", "blk|", "ud|")):
+        return await on_action_callback(update, ctx)
     user_id = q.from_user.id
     chat_id = q.message.chat_id
     await q.answer()
@@ -941,6 +1041,312 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=_settings_keyboard(s),
             parse_mode="Markdown",
         )
+
+
+# ── /today: матчи на сегодня и статус на Фонбете ─────────────────────────────
+
+@require_auth
+async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    s = storage.load_settings(user_id)
+    now = datetime.utcnow()
+    tz = timedelta(hours=s.timezone_offset)
+    today = (now + tz).date()
+    preds = storage.load_predictions()
+
+    mine = [p for p in preds if (p.match_time + tz).date() <= today]
+    later = [p for p in preds if (p.match_time + tz).date() > today]
+    blocked = set(s.blocked_countries or [])
+
+    if not mine:
+        text = f"📅 На сегодня ({today:%d.%m}) прогнозов нет."
+        if later:
+            text += f"\nНа следующие дни: {len(later)} — /list"
+        await update.message.reply_text(text)
+        return
+
+    lines = [f"📅 Сегодня, {today:%d.%m}: {len(mine)}\n"]
+    for i, p in enumerate(mine, 1):
+        emoji, status = userprefs.match_status(p, now)
+        marks = ""
+        if p.id in (s.muted_ids or []):
+            marks += " 🔕"
+        if blocked and userprefs.country_key(p.text) in blocked:
+            marks += " 🚫"
+        t = format_time_local(p, s.timezone_offset)
+        lines.append(f"{i}. ⏰ {t} {emoji} {status}{marks}\n   {display_text_without_time(p, s.timezone_offset)}")
+    if later:
+        lines.append(f"\nНа следующие дни: {len(later)} — /list")
+    if s.quiet_from is not None and userprefs.in_quiet_hours(s.quiet_from, s.quiet_to, now, s.timezone_offset):
+        lines.append(f"\n🌙 Сейчас тихие часы ({s.quiet_from}:00–{s.quiet_to}:00) — уведомления не приходят.")
+    await _send_chunked(update, lines, limit=3900)
+
+
+# ── Личные фильтры: тихие часы, страны, заглушённые матчи ────────────────────
+
+@require_auth
+async def cmd_quiet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    action, a, b = userprefs.parse_quiet_args(ctx.args or [])
+    if action == "show":
+        s = storage.load_settings(user_id)
+        if s.quiet_from is None:
+            await update.message.reply_text(
+                "🌙 Тихие часы выключены.\nВключить: `/quiet 23 8` — не беспокоить с 23:00 до 8:00 "
+                "(по твоему часовому поясу).", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(
+                f"🌙 Тихие часы: {s.quiet_from}:00–{s.quiet_to}:00 (UTC+{s.timezone_offset}).\n"
+                f"Выключить: `/quiet off`", parse_mode="Markdown")
+    elif action == "off":
+        storage.update_settings(user_id, lambda s: (setattr(s, "quiet_from", None), setattr(s, "quiet_to", None)))
+        await update.message.reply_text("🌙 Тихие часы выключены.")
+    elif action == "set":
+        def mut(s):
+            s.quiet_from, s.quiet_to = a, b
+        s = storage.update_settings(user_id, mut)
+        await update.message.reply_text(
+            f"🌙 Тихие часы: {a}:00–{b}:00 (UTC+{s.timezone_offset}). В это время уведомления "
+            f"не приходят (пропущенные не копятся). Выключить: /quiet off")
+    else:
+        await update.message.reply_text("Формат: `/quiet 23 8` (часы 0–23, начало и конец разные) или `/quiet off`",
+                                        parse_mode="Markdown")
+
+
+@require_auth
+async def cmd_block(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    name = userprefs.normalize_country(" ".join(ctx.args or []))
+    if not name:
+        s = storage.load_settings(user_id)
+        if not s.blocked_countries:
+            await update.message.reply_text("🚫 Заблокированных стран нет.\nДобавить: `/block Poland` "
+                                            "(название — как в начале прогноза).", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("🚫 Заблокированные страны:\n" +
+                                            "\n".join(f"• {c.title()}" for c in s.blocked_countries) +
+                                            "\n\nУбрать: `/unblock Poland`", parse_mode="Markdown")
+        return
+    storage.update_settings(user_id, lambda s: s.blocked_countries.append(name)
+                            if name not in s.blocked_countries else None)
+    await update.message.reply_text(f"🚫 Матчи страны «{name.title()}» больше не приходят. Вернуть: /unblock {name}")
+
+
+@require_auth
+async def cmd_unblock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    name = userprefs.normalize_country(" ".join(ctx.args or []))
+    if not name:
+        await update.message.reply_text("Формат: `/unblock Poland`", parse_mode="Markdown")
+        return
+    had = []
+
+    def mut(s):
+        if name in s.blocked_countries:
+            s.blocked_countries.remove(name)
+            had.append(1)
+    storage.update_settings(user_id, mut)
+    await update.message.reply_text(f"✅ «{name.title()}» разблокирована." if had else f"«{name.title()}» не была заблокирована.")
+
+
+@require_auth
+async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    count = []
+    storage.update_settings(user_id, lambda s: (count.append(len(s.muted_ids)), s.muted_ids.clear()))
+    await update.message.reply_text(f"🔔 Заглушённые матчи возвращены: {count[0] if count else 0}.")
+
+
+# ── Диагностика (админ) ──────────────────────────────────────────────────────
+
+@require_admin
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    snap = health.snapshot()
+    now = time.time()
+    f, d = snap["fonbet"], snap["discord"]
+    preds = storage.load_predictions()
+    stats = storage.journal_stats()
+
+    if f["last_ok"] is None and f["last_fail"] is None:
+        fb = "⏳ ещё не запрашивался (нет матчей в окне мониторинга)"
+    elif f["streak"] == 0:
+        fb = f"✅ отвечает, последний успех {health.ago(f['last_ok'], now)}, событий: {f['events']}"
+    else:
+        fb = (f"🚨 не отвечает: {f['streak']} неудач подряд, причина: {f['error']}; "
+              f"последний успех {health.ago(f['last_ok'], now)}")
+
+    if not d["enabled"]:
+        dc = "отключён (нет DISCORD_TOKEN)"
+    else:
+        link = {True: "✅ подключён", False: "🚨 нет соединения", None: "⏳ подключается"}[d["connected"]]
+        dc = f"{link}; перечит: {health.ago(d['last_sync_ok'], now)}"
+        if d["last_sync_error"]:
+            dc += f"\n   последняя ошибка: {d['last_sync_error']}"
+        if d["last_sync_stats"]:
+            st = d["last_sync_stats"]
+            dc += (f"\n   последний проход: найдено {st.get('found', 0)}, новых {st.get('added', 0)}, "
+                   f"пропущено прошедших {st.get('skipped_stale', 0)}, неясных {st.get('skipped_undetermined', 0)}")
+
+    from_dc = sum(1 for p in preds if p.source == "discord")
+    matched = sum(1 for p in preds if p.fonbet_matched)
+    undetermined = len(storage.list_undetermined(1000))
+    alerts = ", ".join(snap["alerts"]) or "нет"
+
+    text = (
+        "🩺 Состояние бота\n\n"
+        f"Фонбет: {fb}\n\n"
+        f"Discord: {dc}\n\n"
+        f"Расписание: {len(preds)} прогнозов (из Discord: {from_dc}), найдено на Фонбете: {matched}\n"
+        f"Матчей без даты ждут решения: {undetermined}" + (" → /undetermined" if undetermined else "") + "\n"
+        f"Журнал матчинга: найдено {stats['found']}, промахов {stats['miss']} → /misses\n"
+        f"Активные тревоги: {alerts}\n"
+        f"Аптайм: {health._fmt_dur(now - snap['started_at'])}"
+    )
+    await update.message.reply_text(text)
+
+
+@require_admin
+async def cmd_misses(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/misses [N] — последние промахи с причинами; /misses found [N] — последние найденные (уровень, %)."""
+    args = list(ctx.args or [])
+    kind = "found" if args and args[0].lower() == "found" else "miss"
+    if args and args[0].lower() == "found":
+        args = args[1:]
+    n = 8
+    if args and args[0].isdigit():
+        n = max(1, min(int(args[0]), 20))
+
+    stats = storage.journal_stats()
+    entries = storage.journal_recent(n, kind)
+    tier_s = ", ".join(f"{k} {v}" for k, v in stats["tiers"].items()) or "—"
+    reason_s = ", ".join(f"{k} {v}" for k, v in stats["reasons"].items()) or "—"
+    tz = timedelta(hours=storage.load_settings(update.effective_user.id).timezone_offset)
+
+    lines = [f"📊 Журнал матчинга ({stats['total']} записей): найдено {stats['found']} ({tier_s}), "
+             f"промахов {stats['miss']} ({reason_s})\n"]
+    if not entries:
+        lines.append("Записей нет." if kind == "miss" else "Найденных пока нет.")
+    for i, e in enumerate(entries, 1):
+        if kind == "miss":
+            try:
+                mt = datetime.fromisoformat(e["match_time"]) + tz
+                when = f"{mt:%d.%m %H:%M}"
+            except Exception:
+                when = "?"
+            lines.append(f"{i}. ⏰ {when} · {e.get('text', '')[:90]}\n   ❌ {e.get('why')}")
+            for c in (e.get("best") or [])[:3]:
+                lg = f" [{c['league']}]" if c.get("league") else ""
+                lines.append(f"   • {c['score']}% {c['match']}{lg}: {c['why']}")
+        else:
+            lines.append(f"{i}. {e.get('score')}% [{e.get('tier')}] за {e.get('mins_before_start')} мин до старта"
+                         f"{' (лайв)' if e.get('live') else ''}\n   {e.get('text', '')[:80]}\n   → {e.get('match')}"
+                         f"{' · ' + e['league'] if e.get('league') else ''}")
+    lines.append("\nЕщё: /misses 15 · /misses found")
+    await _send_chunked(update, lines, limit=3900)
+
+
+@require_admin
+async def cmd_aliases(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    rows = storage.list_aliases(40)
+    if not rows:
+        await update.message.reply_text("🔤 Запомненных пар названий пока нет. Бот добавляет их сам, когда уверенно "
+                                        "находит матч, хотя названия различались.")
+        return
+    lines = [f"🔤 Запомненные пары (прогноз → Фонбет), {len(rows)}:\n"]
+    for r in rows:
+        lines.append(f"• {r['pred']} → {', '.join(r['evs'])} (×{r['n']})")
+    lines.append("\nУдалить ошибочную: /unalias <название из прогноза>")
+    await _send_chunked(update, lines, limit=3900)
+
+
+@require_admin
+async def cmd_unalias(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    name = " ".join(ctx.args or []).strip()
+    if not name:
+        await update.message.reply_text("Формат: /unalias <название команды как в прогнозе>")
+        return
+    ok = storage.remove_alias(name)
+    await update.message.reply_text("🗑 Алиас удалён." if ok else "Такого алиаса нет (см. /aliases).")
+
+
+@require_admin
+async def cmd_undetermined(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    items = storage.list_undetermined(10)
+    if not items:
+        await update.message.reply_text("✅ Матчей с неопределённой датой нет.")
+        return
+    for item in items:
+        btns = storage.ud_buttons(item)
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton(l, callback_data=d) for l, d in btns[:2]],
+            [InlineKeyboardButton(l, callback_data=d) for l, d in btns[2:]],
+        ])
+        await update.message.reply_text(
+            f"❓ Дата не определена\n\n{item['text'][:300]}\n\n{item['reason']}.\n\nКогда он играет?",
+            reply_markup=markup,
+        )
+
+
+# ── Кнопки действий: заглушить матч / страну, дата неопределённого матча ─────
+
+async def on_action_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    user_id = q.from_user.id
+    if not auth.is_authorized(user_id):
+        await q.answer("🔒 Доступ закрыт.", show_alert=True)
+        return
+    kind, _, rest = (q.data or "").partition("|")
+
+    if kind == "mute":
+        pred_id = rest
+
+        def mut(s):
+            if pred_id not in s.muted_ids:
+                s.muted_ids.append(pred_id)
+            live = {p.id for p in storage.load_predictions()}
+            s.muted_ids[:] = [i for i in s.muted_ids if i in live]   # старые id чистим
+        storage.update_settings(user_id, mut)
+        await q.answer("🔕 Матч заглушен — по нему больше не будет уведомлений. Вернуть: /unmute", show_alert=True)
+
+    elif kind == "blk":
+        pred = next((p for p in storage.load_predictions() if p.id == rest), None)
+        country = userprefs.country_key(pred.text) if pred else ""
+        if not country:
+            await q.answer("Матч уже завершён — заблокируй страну командой /block <страна>", show_alert=True)
+            return
+        storage.update_settings(user_id, lambda s: s.blocked_countries.append(country)
+                                if country not in s.blocked_countries else None)
+        await q.answer(f"🚫 Страна «{country.title()}» заблокирована. Вернуть: /unblock {country}", show_alert=True)
+
+    elif kind == "ud":
+        if not auth.is_admin(user_id):
+            await q.answer("⛔ Только админ.", show_alert=True)
+            return
+        try:
+            mid, h8, choice = rest.split("|")
+        except ValueError:
+            await q.answer("Некорректная кнопка", show_alert=True)
+            return
+        res = await asyncio.to_thread(storage.resolve_undetermined, mid, h8, choice)
+        head = (q.message.text or "").split("\n\n")[1] if q.message and q.message.text else res["text"]
+        status = res["status"]
+        if status == "notfound":
+            msg = "ℹ️ Этот вопрос уже неактуален (матч решён или сообщение пропало)."
+        elif status == "skipped":
+            msg = f"🚫 Пропущен: {head}"
+        elif status == "past":
+            msg = f"⏭ Этот матч уже прошёл на выбранную дату — не добавлен: {head}"
+        else:
+            local = res["dt"] + timedelta(hours=config.DEFAULT_TZ_OFFSET)
+            msg = f"✅ {'Добавлен' if status == 'added' else 'Уже в расписании'} на {local:%d.%m %H:%M}: {head}"
+        await q.answer()
+        await q.edit_message_text(msg)
+        if status == "added" and res.get("pred"):
+            try:
+                import discord_listener
+                await discord_listener._notify_added([res["pred"]], "дата выбрана админом")
+            except Exception as e:
+                logger.error(f"notify_added after ud failed: {e}")
 
 
 # ── Уведомления админам ──────────────────────────────────────────────────────

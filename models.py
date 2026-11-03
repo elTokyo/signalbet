@@ -19,6 +19,9 @@ class Prediction:
     close_match_notified: bool = False
     source: str = "manual"
     # Происхождение из Discord (старые записи в Gist без этих полей читаются нормально)
+    # Статус на Фонбете (для /today): найден ли матч хоть раз и в каком состоянии
+    fonbet_matched: bool = False
+    fonbet_state: Optional[str] = None    # "line" | "live" — последнее виденное состояние
     msg_id: Optional[str] = None          # постоянный id Discord-сообщения
     first_seen_at: Optional[str] = None   # когда бот впервые увидел матч (UTC, ISO)
     date_basis: Optional[str] = None      # чем обоснована дата матча (см. match_dates)
@@ -36,6 +39,8 @@ class Prediction:
             "leon_notified": self.leon_notified,
             "close_match_notified": self.close_match_notified,
             "source": self.source,
+            "fonbet_matched": self.fonbet_matched,
+            "fonbet_state": self.fonbet_state,
             "msg_id": self.msg_id,
             "first_seen_at": self.first_seen_at,
             "date_basis": self.date_basis,
@@ -55,6 +60,8 @@ class Prediction:
             leon_notified=d.get("leon_notified", False),
             close_match_notified=d.get("close_match_notified", False),
             source=d.get("source", "manual"),
+            fonbet_matched=d.get("fonbet_matched", False),
+            fonbet_state=d.get("fonbet_state"),
             msg_id=d.get("msg_id"),
             first_seen_at=d.get("first_seen_at"),
             date_basis=d.get("date_basis"),
@@ -75,6 +82,12 @@ class UserSettings:
     notify_voice: bool = True            # заход/выход в голосовой Discord
     # Legacy-поле (раньше отвечало за прематч+лайв+кривые). Оставляем для миграции.
     fonbet_notifications: bool = True
+    # Фильтры (личные): тихие часы по местному времени пользователя, заглушенные матчи
+    # (id прогнозов) и заблокированные страны (нормализованные, см. userprefs.country_key)
+    quiet_from: Optional[int] = None
+    quiet_to: Optional[int] = None
+    muted_ids: list = field(default_factory=list)
+    blocked_countries: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -88,6 +101,10 @@ class UserSettings:
             "notify_new_preds": self.notify_new_preds,
             "notify_voice": self.notify_voice,
             "fonbet_notifications": self.fonbet_notifications,
+            "quiet_from": self.quiet_from,
+            "quiet_to": self.quiet_to,
+            "muted_ids": list(self.muted_ids),
+            "blocked_countries": list(self.blocked_countries),
         }
 
     @classmethod
@@ -106,4 +123,8 @@ class UserSettings:
             notify_new_preds=d.get("notify_new_preds", True),
             notify_voice=d.get("notify_voice", True),
             fonbet_notifications=legacy_fonbet,
+            quiet_from=d.get("quiet_from"),
+            quiet_to=d.get("quiet_to"),
+            muted_ids=list(d.get("muted_ids") or []),
+            blocked_countries=list(d.get("blocked_countries") or []),
         )

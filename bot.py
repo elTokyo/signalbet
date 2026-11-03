@@ -87,6 +87,18 @@ def main():
     app.add_handler(CommandHandler("voice",       handlers.cmd_voice))
     app.add_handler(CommandHandler("factors",     handlers.cmd_factors))
     app.add_handler(CommandHandler("bk",          handlers.cmd_bk))
+    # /commands и опечатка-синоним /comands — один и тот же список
+    app.add_handler(CommandHandler(["commands", "comands"], handlers.cmd_commands))
+    app.add_handler(CommandHandler("status",       handlers.cmd_status))
+    app.add_handler(CommandHandler("misses",       handlers.cmd_misses))
+    app.add_handler(CommandHandler("aliases",      handlers.cmd_aliases))
+    app.add_handler(CommandHandler("unalias",      handlers.cmd_unalias))
+    app.add_handler(CommandHandler("undetermined", handlers.cmd_undetermined))
+    app.add_handler(CommandHandler("today",        handlers.cmd_today))
+    app.add_handler(CommandHandler("quiet",        handlers.cmd_quiet))
+    app.add_handler(CommandHandler("block",        handlers.cmd_block))
+    app.add_handler(CommandHandler("unblock",      handlers.cmd_unblock))
+    app.add_handler(CommandHandler("unmute",       handlers.cmd_unmute))
     app.add_handler(CommandHandler("broadcast", handlers.cmd_broadcast))
     app.add_handler(CommandHandler("cancel",    handlers.cmd_cancel))
 

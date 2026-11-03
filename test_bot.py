@@ -8,6 +8,7 @@
 - извлечение команд
 - парсинг ставок (победитель/фора)
 - логику кривизны (СЛУЧАЙ 1/2/3)
+- здоровье бота/алерты, личные фильтры, журнал и алиасы, вопросы админу по неопределённым датам, тик планировщика
 - матчинг с Фонбетом: пороги 60/50, «тот же слот» (время + страна/лига), окно мониторинга
 - даты матчей из Discord-сообщений (публикация/правка/полночь/дубли/гонки) — с контролируемым временем
 """
@@ -1242,6 +1243,613 @@ def test_monitor_window_retention():
         check("Матч начался 17 мин назад — уже за окном, не добавляется", env.times() == [] and st["skipped_stale"] == 1)
 
 
+# ── Апгрейд: здоровье, фильтры, журнал, алиасы, неопределённые даты, тик ─────
+
+import asyncio
+import time as _time
+import health
+import userprefs
+
+
+def test_models_new_fields():
+    print("\n[Модели: новые поля обратно совместимы]")
+    old = models.Prediction.from_dict({"id": "a", "text": "t", "match_time": "2026-10-21T10:00:00"})
+    check("Старая запись без новых полей читается (fonbet_matched=False, state=None)",
+          old.fonbet_matched is False and old.fonbet_state is None)
+    p = models.Prediction(text="t", match_time=datetime(2026, 10, 21, 10), fonbet_matched=True, fonbet_state="live")
+    check("fonbet_matched/state переживают to_dict → from_dict",
+          models.Prediction.from_dict(p.to_dict()).fonbet_state == "live")
+    s = models.UserSettings.from_dict({"chat_id": 1})
+    check("Старые настройки: фильтры пустые", s.quiet_from is None and s.muted_ids == [] and s.blocked_countries == [])
+    s2 = models.UserSettings(chat_id=1, quiet_from=23, quiet_to=8, muted_ids=["x"], blocked_countries=["poland"])
+    r = models.UserSettings.from_dict(s2.to_dict())
+    check("Тихие часы, заглушки и страны переживают сохранение",
+          (r.quiet_from, r.quiet_to, r.muted_ids, r.blocked_countries) == (23, 8, ["x"], ["poland"]))
+    check("Списки не общие между экземплярами", models.UserSettings(chat_id=1).muted_ids is not models.UserSettings(chat_id=2).muted_ids)
+
+
+def test_health_alerts():
+    print("\n[Здоровье: алерты админам]")
+    health.reset()
+    t0 = _time.time() + 10_000          # далеко за периодом «после старта не тревожим»
+    check("В первые минуты после старта тревог нет", health.evaluate(_time.time()) == [])
+
+    for i in range(health.FONBET_FAIL_STREAK - 1):
+        health.fonbet_result(False, 0, "HTTP 503", now=t0 + i)
+    check("4 неудачи подряд — ещё не авария", health.evaluate(t0 + 10) == [])
+    health.fonbet_result(False, 0, "HTTP 503", now=t0 + 11)
+    ev = health.evaluate(t0 + 12)
+    check("5-я неудача подряд → ровно одна тревога про Фонбет с причиной",
+          len(ev) == 1 and ev[0][:2] == ("fonbet_down", "raise") and "HTTP 503" in ev[0][2])
+    health.fonbet_result(False, 0, "HTTP 503", now=t0 + 30)
+    check("Тревога не повторяется, пока авария продолжается", health.evaluate(t0 + 60) == [])
+    health.fonbet_result(True, 3500, now=t0 + 300)
+    ev = health.evaluate(t0 + 301)
+    check("Фонбет ожил → одно сообщение «снова отвечает» с длительностью",
+          len(ev) == 1 and ev[0][1] == "clear" and "снова отвечает" in ev[0][2] and "мин" in ev[0][2])
+    check("И больше событий нет", health.evaluate(t0 + 400) == [])
+
+    health.reset()
+    check("Discord отключён в конфиге → его тревог нет",
+          all(not e[0].startswith("discord") for e in health.evaluate(t0 + 5000)))
+    health.discord_enabled(True)
+    health.discord_connected(True, now=t0)
+    health.discord_sync(True, {"added": 1}, now=t0)
+    check("Всё в порядке → тишина", health.evaluate(t0 + 600) == [])
+    health.discord_connected(False, now=t0 + 700)
+    check("Короткий реконнект (<3 мин) — не авария", health.evaluate(t0 + 800) == [])
+    ev = health.evaluate(t0 + 700 + health.DISCORD_DOWN_SEC + 5)
+    check("Нет соединения дольше 3 мин → тревога", any(e[0] == "discord_down" and e[1] == "raise" for e in ev))
+    health.discord_connected(True, now=t0 + 1200)
+    ev = health.evaluate(t0 + 1210)
+    check("Соединение вернулось → «снова подключён»", any(e[0] == "discord_down" and e[1] == "clear" for e in ev))
+
+    health.reset()
+    health.discord_enabled(True)
+    health.discord_connected(True, now=t0)
+    ev = health.evaluate(t0 + health.DISCORD_SYNC_STALE_SEC + 60)
+    check("Перечит не проходил >30 мин → тревога discord_stale", any(e[0] == "discord_stale" for e in ev))
+    health.discord_sync(True, {"added": 0}, now=t0 + health.DISCORD_SYNC_STALE_SEC + 100)
+    ev = health.evaluate(t0 + health.DISCORD_SYNC_STALE_SEC + 110)
+    check("Перечит прошёл → тревога снята", any(e[0] == "discord_stale" and e[1] == "clear" for e in ev))
+    health.reset()
+
+
+def test_userprefs():
+    print("\n[Личные фильтры: тихие часы, страны, заглушка]")
+    q = userprefs.in_quiet_hours
+    at = lambda h, m=0: L(20, h, m)         # локальное (МСК) время → UTC
+    check("Тихие часы 23→8: 23:30 внутри", q(23, 8, at(23, 30), 3))
+    check("…03:00 внутри (через полночь)", q(23, 8, at(3), 3))
+    check("…08:00 уже снаружи (конец не включён)", not q(23, 8, at(8), 3))
+    check("…12:00 снаружи", not q(23, 8, at(12), 3))
+    check("Обычный интервал 13→15", q(13, 15, at(14), 3) and not q(13, 15, at(15), 3))
+    check("Часы считаются по поясу пользователя (UTC+10: 23:00 UTC = 09:00 местн.)", not q(23, 8, datetime(2026, 10, 20, 23, 0), 10))
+    check("Не заданы → не тихо", not q(None, None, at(3), 3))
+
+    check("/quiet 23 8", userprefs.parse_quiet_args(["23", "8"]) == ("set", 23, 8))
+    check("/quiet off", userprefs.parse_quiet_args(["off"])[0] == "off")
+    check("/quiet без аргументов — показать", userprefs.parse_quiet_args([])[0] == "show")
+    check("/quiet 25 8 и 5 5 — ошибка", userprefs.parse_quiet_args(["25", "8"])[0] == "error"
+          and userprefs.parse_quiet_args(["5", "5"])[0] == "error" and userprefs.parse_quiet_args(["a", "b"])[0] == "error")
+
+    check("Страна из прогноза (англ.)", userprefs.country_key("Poland. 4 Liga. Warmia 16-00 A — B") == "poland")
+    check("Страна из прогноза (рус., с «Футбол.»)", userprefs.country_key("Футбол. Нигерия. Кубок. 18-00 А — Б") == "нигерия")
+    check("Страна со скобками", userprefs.country_key("Myanmar (Burma). Youth 15-00 A — B") == "myanmar burma")
+
+    pred = models.Prediction(text="Poland. 4 Liga. 16-00 A — B", match_time=L(20, 16))
+    base = models.UserSettings(chat_id=1)
+    now = L(20, 12)
+    check("Без фильтров можно слать", userprefs.user_allows(base, pred, now))
+    check("Заглушённый матч — нельзя", not userprefs.user_allows(models.UserSettings(chat_id=1, muted_ids=[pred.id]), pred, now))
+    check("Заблокированная страна — нельзя",
+          not userprefs.user_allows(models.UserSettings(chat_id=1, blocked_countries=["poland"]), pred, now))
+    check("Другая страна заблокирована — можно",
+          userprefs.user_allows(models.UserSettings(chat_id=1, blocked_countries=["germany"]), pred, now))
+    check("Тихие часы — нельзя",
+          not userprefs.user_allows(models.UserSettings(chat_id=1, quiet_from=23, quiet_to=8), pred, L(20, 2)))
+    check("Тихие часы действуют и на сообщения без прогноза (pred=None)",
+          not userprefs.user_allows(models.UserSettings(chat_id=1, quiet_from=23, quiet_to=8), None, L(20, 2)))
+
+    mk = lambda **kw: models.Prediction(text="t", match_time=L(20, 18), **kw)
+    now = L(20, 17)
+    check("Статус: далеко до старта", userprefs.match_status(mk(), L(20, 10))[0] == "⏳")
+    check("Статус: ищу", userprefs.match_status(mk(), now)[0] == "🔎")
+    check("Статус: в линии", userprefs.match_status(mk(fonbet_matched=True, fonbet_state="line"), now)[1] == "в линии")
+    check("Статус: в лайве", userprefs.match_status(mk(fonbet_matched=True, fonbet_state="live"), L(20, 18, 5))[1] == "в лайве")
+    check("Статус: не найден после старта", userprefs.match_status(mk(), L(20, 18, 12))[0] == "❓")
+
+
+def test_fonbet_aliases_diag():
+    print("\n[Фонбет: время-первым, алиасы, диагностика промахов]")
+    find = fonbet.find_matching_event
+    start = L(20, 16)
+    pred = "Poland. 4 Liga. Warmia 16-00 alpha beta gamma — delta epsilon zeta п1 2+"
+
+    # время — первым: событие с идеальными названиями, но в другое время, не принимается
+    far = _ev("alpha beta gamma", "delta epsilon zeta", start + timedelta(hours=2), league=None)
+    check("Идеальные названия, но старт на 2 часа позже → не найдено", find(pred, [far], expected_utc=start) is None)
+    check("Без ожидаемого времени фильтр по времени не применяется (как раньше)", find(pred, [far]) is not None)
+    many = [_ev(f"zz{i} yy", f"xx{i} ww", start + timedelta(minutes=i * 7), league=None, eid=100 + i) for i in range(40)]
+    r = find(pred, many + [_ev("alpha beta gamma", "delta epsilon zeta", start, league=None, eid=1)], expected_utc=start)
+    check("Среди множества чужих событий находит нужное", r is not None and r["id"] == 1)
+
+    check("prediction_script: английский", fonbet.prediction_script(pred) == "en")
+    check("prediction_script: русский", fonbet.prediction_script("Футбол. Нигерия. Кубок. 18-00 Альфа Бета — Гамма Дельта п2 3+") == "ru")
+    check("prediction_script: «п2» в английском прогнозе не делает его русским",
+          fonbet.prediction_script("Poland. 4 Liga. 16-00 Sokol Ostroda — DKS Dobre Miasto п2 5+") == "en")
+
+    # алиасы
+    ev0 = _ev("kappa lambda", "sigma omega", start, league=None)
+    al = {fonbet.alias_norm("alpha beta gamma"): [fonbet.alias_norm("kappa lambda")],
+          fonbet.alias_norm("delta epsilon zeta"): [fonbet.alias_norm("sigma omega")]}
+    check("Без алиасов совсем разные названия не находятся", find(pred, [ev0], expected_utc=start) is None)
+    r = find(pred, [ev0], expected_utc=start, aliases=al)
+    check("Обе команды известны как алиасы → найдено как base (100%)", r is not None and r["match_tier"] == "base" and r["match_score"] == 100)
+    half = {k: v for k, v in list(al.items())[:1]}
+    check("Известна одна команда (50%) и лига неизвестна → не найдено, одного алиаса мало без лиги",
+          find(pred, [ev0], expected_utc=start, aliases=half) is None)
+    check("Известна одна команда (50%) + то же время + та же лига → найдено",
+          find(pred, [_ev("kappa lambda", "sigma omega", start)], expected_utc=start, aliases=half) is not None)
+
+    # какие пары запоминать
+    ev50 = _ev("alpha beta kappa", "delta epsilon omega", start)
+    r = find(pred, [ev50], expected_utc=start)
+    check("same_slot (50%/50%): запоминаются обе пары названий",
+          sorted(r["alias_pairs"]) == sorted([("alpha beta gamma", "alpha beta kappa"), ("delta epsilon zeta", "delta epsilon omega")]))
+    pred2 = "Poland. 4 Liga. Warmia 16-00 p q r s — m n o п1 2+"
+    r = find(pred2, [_ev("p q r s t", "m n z", start, league=None)], expected_utc=start)
+    check("base 80%/50%: запоминается только слабая сторона",
+          r["match_tier"] == "base" and r["alias_pairs"] == [("m n o", "m n z")])
+    r = find(pred, [_ev("alpha beta gamma", "delta epsilon zeta", start, league=None)], expected_utc=start)
+    check("100%/100%: запоминать нечего", r["alias_pairs"] == [])
+
+    # диагностика промахов
+    def miss(events, **kw):
+        d = {}
+        res = find(pred, events, expected_utc=start, diag=d, **kw)
+        return res, d
+    res, d = miss([])
+    check("Диагностика: пустой список событий", res is None and d["reason"] == "no_events")
+    res, d = miss([_ev("qqq www", "eee rrr", start)])
+    check("Диагностика: похожих команд нет", d["reason"] == "no_similar")
+    res, d = miss([_ev("alpha beta gamma", "delta epsilon zeta", start + timedelta(minutes=40))])
+    check("Диагностика: названия идеальны, но время не то → «время … 40 мин»",
+          d["reason"] == "time" and "40 мин" in d["best"][0]["why"] and d["best"][0]["score"] == 100)
+    res, d = miss([_ev("alpha beta kappa", "delta epsilon omega", start, league="Germany. 4 Liga")])
+    check("Диагностика: 50%, лига чужая → «страна/лига не совпали»", d["reason"] == "league" and "Germany" in d["best"][0]["why"])
+    res, d = miss([_ev("alpha beta kappa", "delta epsilon omega", start, league=None)])
+    check("Диагностика: 50%, лига неизвестна → так и сказано", d["reason"] == "league" and "неизвестна" in d["best"][0]["why"])
+    res, d = miss([_ev("alpha beta x y", "delta epsilon x y", start)])   # по 40% на команду
+    check("Диагностика: ниже 50% → «названия N% — ниже 50%»", d["reason"] == "name" and "50%" in d["best"][0]["why"])
+    res, d = miss([_ev("alpha beta kappa", "delta epsilon omega", start, eid=1), _ev("alpha beta lambda", "delta epsilon sigma", start, eid=2)])
+    check("Диагностика: неоднозначно", res is None and d["reason"] == "ambiguous")
+    res, d = miss([_ev("alpha beta gamma", "delta epsilon zeta", start)])
+    check("Найдено → diag не заполняется", res is not None and d == {})
+    ru_pred = "Футбол. Польша. 16-00 Альфа Бета — Дельта Эпсилон п1 2+"
+    d = {}
+    find(ru_pred, [_ev("Alpha Beta", "Delta Epsilon", start)], expected_utc=start, diag=d)
+    check("Русский прогноз против английского списка не находится (поэтому нужен lang=ru)", d.get("reason") in ("no_similar", "name"))
+    check("URL запроса получает нужный язык", "lang=ru" in fonbet._endpoint_url("h.example", "ru") and "lang=en" in fonbet._endpoint_url("h.example"))
+
+
+def test_storage_journal_aliases_settings():
+    print("\n[Хранилище: журнал, алиасы, личные настройки]")
+    with _Env() as env:
+        for i in range(205):
+            storage.journal_add({"kind": "miss" if i % 2 else "found", "tier": "base", "reason": "time", "n": i})
+        j = storage.journal_recent(300)
+        check("Журнал — кольцо на 200 записей", len(j) == storage.JOURNAL_MAX)
+        check("Новые первыми, старые вытеснены", j[0]["n"] == 204 and j[-1]["n"] == 5)
+        st = storage.journal_stats()
+        check("Статистика журнала по видам, уровням и причинам",
+              st["found"] + st["miss"] == 200 and st["tiers"] == {"base": st["found"]} and st["reasons"] == {"time": st["miss"]})
+        check("Фильтр по виду", all(e["kind"] == "miss" for e in storage.journal_recent(10, "miss")))
+        # журнал не затирает расписание и наоборот
+        storage.save_predictions(predictions=[models.Prediction(text="x", match_time=L(20, 12))])
+        storage.journal_add({"kind": "found"})
+        check("Запись журнала не стирает расписание", len(env.sched()) == 1)
+        storage.save_predictions(predictions=[])
+        check("Сохранение расписания не стирает журнал", len(storage.journal_recent(300)) == 200)
+
+    with _Env() as env:
+        check("Алиасов пока нет", storage.load_aliases() == {} and storage.list_aliases() == [])
+        n = storage.add_aliases([("Dinamo Kyiv", "Dynamo Kyiv"), ("Dinamo Kyiv", "Dynamo Kyiv"), ("same", "SAME"), ("", "x")])
+        check("Запоминаются пары (одинаковые после нормализации и пустые — нет)", n == 2 and len(storage.list_aliases()) == 1)
+        al = storage.load_aliases()
+        check("load_aliases отдаёт нормализованные ключи", al == {"dinamokyiv": ["dynamokyiv"]})
+        storage.add_aliases([("dinamo kyiv", "Dynamo Kiev")])
+        check("Кэш сброшен — новая пара видна сразу, счётчик растёт",
+              len(storage.load_aliases()["dinamokyiv"]) == 2 and storage.list_aliases()[0]["n"] == 3)
+        check("Удаление алиаса по названию (любой регистр)", storage.remove_alias("DINAMO  kyiv") and storage.load_aliases() == {})
+        check("Удаление несуществующего", storage.remove_alias("нет такого") is False)
+
+    with _Env() as env:
+        def add(i):
+            storage.update_settings(7, lambda s: s.muted_ids.append(f"m{i}"))
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(add, range(20)))
+        check("update_settings атомарен: 20 параллельных добавлений — ничего не потеряно",
+              len(storage.load_settings(7).muted_ids) == 20)
+        storage.update_settings(7, lambda s: setattr(s, "quiet_from", 23))
+        check("Прочие поля при этом сохраняются", storage.load_settings(7).quiet_from == 23 and len(storage.load_settings(7).muted_ids) == 20)
+
+
+def test_undetermined_buttons_flow():
+    print("\n[Неопределённая дата → вопрос админу кнопками]")
+    content = M("14:00", "А", "Б")
+    snp = snap(70, L(20, 11), content, edited=L(20, 23))      # бот увидел уже правленое сообщение
+    now = L(20, 23, 5)
+    with _Env() as env:
+        st = env.apply([snp], now=now)
+        asks = st["undetermined_new"]
+        check("Неопределённый матч попал в вопросы админу (один)", env.times() == [] and len(asks) == 1 and asks[0]["mid"] == "70")
+        st = env.apply([snp], now=now + timedelta(minutes=15), full_scan=True, scan_floor=datetime.min)
+        check("Повторный перечит не спрашивает второй раз", st["undetermined_new"] == [])
+        snp2 = snap(70, L(20, 11), content + "\n" + M("20:00", "В", "Г"), edited=L(20, 23, 30))
+        st = env.apply([snp2], now=now + timedelta(minutes=40))
+        asks2 = st["undetermined_new"]
+        check("Правка сообщения: про прежний матч не спрашивает, про новый — спрашивает",
+              all("В —" in a["text"] or "В" in a["text"] for a in asks2) and not any("А —" in a["text"] for a in asks2))
+
+    with _Env() as env:
+        env.apply([snp], now=now)
+        item = storage.list_undetermined()[0]
+        btns = storage.ud_buttons(item, now=now, tz=TZ)
+        check("Три кнопки: сегодня, завтра, пропустить", [b[0] for b in btns] == ["📅 Сегодня 20.10", "📅 Завтра 21.10", "🚫 Пропустить"])
+        check("callback_data укладывается в 64 байта Telegram", all(len(b[1].encode()) <= 64 for b in btns))
+        res = storage.resolve_undetermined(item["mid"], item["h8"], btns[1][1].split("|")[3], now=now, tz=TZ)
+        check("«Завтра» → матч добавлен на 21.10 14:00 с основанием admin",
+              res["status"] == "added" and env.times() == ["21 14:00"] and env.sched()[0].date_basis == "admin")
+        env.apply([snap(70, L(20, 11), content + " ✅", edited=L(20, 23, 50))], now=now + timedelta(minutes=45))
+        check("Правка сообщения не снимает выбранную админом дату", env.times() == ["21 14:00"])
+        check("Решённый матч больше не в списке неопределённых", storage.list_undetermined() == [])
+        again = storage.resolve_undetermined(item["mid"], item["h8"], "261021", now=now, tz=TZ)
+        check("Повторное нажатие кнопки безопасно", again["status"] == "notfound" and len(env.sched()) == 1)
+
+    with _Env() as env:
+        env.apply([snp], now=now)
+        item = storage.list_undetermined()[0]
+        res = storage.resolve_undetermined(item["mid"], item["h8"], "261020", now=now, tz=TZ)
+        check("Дата, на которую матч уже прошёл → не добавляется (past)", res["status"] == "past" and env.times() == [])
+        check("…и вопрос остаётся открытым", len(storage.list_undetermined()) == 1)
+        res = storage.resolve_undetermined(item["mid"], item["h8"], "s", now=now, tz=TZ)
+        check("«Пропустить» → снят с очереди, в расписание не попал",
+              res["status"] == "skipped" and storage.list_undetermined() == [] and env.times() == [])
+        st = env.apply([snap(70, L(20, 11), content, edited=L(20, 23, 20))], now=now + timedelta(minutes=30))
+        check("После «Пропустить» бот про этот матч больше не спрашивает", st["undetermined_new"] == [])
+    with _Env() as env:
+        check("Неизвестная кнопка/сообщение → notfound", storage.resolve_undetermined("999", "deadbeef", "s")["status"] == "notfound")
+
+
+class _Recorder:
+    """Подмена scheduler._broadcast: запоминает, кому и что ушло."""
+    def __init__(self):
+        self.sent = []
+
+    async def __call__(self, app, chat_ids, text, url=None, pred=None):
+        self.sent.append({"to": list(chat_ids), "text": text, "pred": pred.id if pred else None, "url": url})
+
+
+def _tick_env(events_by_lang, recipients=(111, 222)):
+    """Готовит scheduler к прогону тика: фейковые Фонбет, рассылка, получатели."""
+    rec = _Recorder()
+    calls = []
+
+    def fake_fetch(lang="en"):
+        calls.append(lang)
+        return events_by_lang.get(lang, [])
+    saved = (scheduler.fetch_events, scheduler._broadcast, storage.get_all_recipient_chat_ids)
+    scheduler.fetch_events, scheduler._broadcast = fake_fetch, rec
+    storage.get_all_recipient_chat_ids = lambda: list(recipients)
+    scheduler._sent_prematch.clear(); scheduler._sent_live.clear()
+    scheduler._sent_crooked.clear(); scheduler._sent_close_match.clear()
+    scheduler._last_diag.clear(); scheduler._diag_ts.clear()
+    health.reset()
+
+    def restore():
+        scheduler.fetch_events, scheduler._broadcast, storage.get_all_recipient_chat_ids = saved
+    return rec, calls, restore
+
+
+def _utc_event(t1, t2, start_utc, league="Poland. 4 Liga. Warmia", eid=1):
+    ev = _ev(t1, t2, start_utc, league=league, eid=eid)
+    ev["league_id"] = 777
+    return ev
+
+
+def test_scheduler_fonbet_tick_integration():
+    print("\n[Планировщик: тик Фонбета — поиск, журнал, алиасы, фильтры]")
+    now = datetime.utcnow()
+    start = (now + timedelta(minutes=5)).replace(second=0, microsecond=0)
+    pred_text = "Poland. 4 Liga. Warmia 16-00 alpha beta gamma — delta epsilon zeta п1 2+"
+
+    with _Env() as env:
+        pred = models.Prediction(text=pred_text, match_time=start, source="manual")
+        storage.save_predictions(predictions=[pred])
+        events = {"en": [_utc_event("alpha beta kappa", "delta epsilon omega", start)]}
+        rec, calls, restore = _tick_env(events)
+        try:
+            storage.update_settings(222, lambda s: s.blocked_countries.append("poland"))
+            asyncio.run(scheduler._fonbet_tick_inner(None))
+            line_msgs = [m for m in rec.sent if "ЛИНИЮ" in m["text"]]
+            check("Найден по пониженному порогу (same_slot) → уведомление «вышел в линию»", len(line_msgs) == 1)
+            check("Получатель с заблокированной страной уведомление не получил", line_msgs[0]["to"] == [111])
+            check("К уведомлению привязан прогноз (кнопки «заглушить»)", line_msgs[0]["pred"] == pred.id)
+            saved_pred = env.sched()[0]
+            check("Статус сохранён: найден, «в линии»", saved_pred.fonbet_matched and saved_pred.fonbet_state == "line")
+            j = storage.journal_recent(5, "found")
+            check("Журнал: запись «найден» с уровнем same_slot, 50% и лигой",
+                  len(j) == 1 and j[0]["tier"] == "same_slot" and j[0]["score"] == 50 and "Warmia" in (j[0]["league"] or ""))
+            check("Алиасы запомнены (обе пары)", len(storage.list_aliases()) == 2)
+            check("Здоровье: Фонбет отвечает", health.snapshot()["fonbet"]["streak"] == 0 and health.snapshot()["fonbet"]["events"] == 1)
+            check("Русский список не запрашивался для английского прогноза", calls == ["en"])
+
+            n = len(rec.sent)
+            asyncio.run(scheduler._fonbet_tick_inner(None))
+            check("Следующий тик: повторных уведомлений и записей журнала нет",
+                  len([m for m in rec.sent if "ЛИНИЮ" in m["text"]]) == 1 and len(storage.journal_recent(10, "found")) == 1)
+        finally:
+            restore()
+
+    # Алиас помогает следующему матчу тех же команд, даже без лиги
+    with _Env() as env:
+        storage.add_aliases([("alpha beta gamma", "kappa lambda"), ("delta epsilon zeta", "sigma omega")])
+        pred = models.Prediction(text=pred_text, match_time=start, source="manual")
+        storage.save_predictions(predictions=[pred])
+        rec, calls, restore = _tick_env({"en": [_utc_event("kappa lambda", "sigma omega", start, league=None)]}, recipients=(111,))
+        try:
+            asyncio.run(scheduler._fonbet_tick_inner(None))
+            check("Запомненные названия работают: совсем другие имена найдены по алиасам",
+                  len([m for m in rec.sent if "ЛИНИЮ" in m["text"]]) == 1)
+        finally:
+            restore()
+
+    # Русский прогноз → второй запрос lang=ru
+    with _Env() as env:
+        ru_text = "Футбол. Польша. 16-00 Альфа Бета — Дельта Эпсилон п1 2+"
+        pred = models.Prediction(text=ru_text, match_time=start, source="manual")
+        storage.save_predictions(predictions=[pred])
+        rec, calls, restore = _tick_env({
+            "en": [_utc_event("Alfa Beta", "Delta Epsilon", start, league="Poland. 4 Liga", eid=1)],
+            "ru": [_utc_event("Альфа Бета", "Дельта Эпсилон", start, league="Польша. 4 Лига", eid=1)],
+        }, recipients=(111,))
+        try:
+            asyncio.run(scheduler._fonbet_tick_inner(None))
+            check("Прогноз на русском: запрошен lang=ru и найден по русским названиям",
+                  "ru" in calls and len([m for m in rec.sent if "ЛИНИЮ" in m["text"]]) == 1)
+        finally:
+            restore()
+
+    # Тихие часы и заглушка
+    with _Env() as env:
+        pred = models.Prediction(text=pred_text, match_time=start, source="manual")
+        storage.save_predictions(predictions=[pred])
+        hour = (now + timedelta(hours=TZ)).hour
+        storage.update_settings(111, lambda s: (setattr(s, "quiet_from", hour), setattr(s, "quiet_to", (hour + 2) % 24)))
+        storage.update_settings(222, lambda s: s.muted_ids.append(pred.id))
+        rec, calls, restore = _tick_env({"en": [_utc_event("alpha beta gamma", "delta epsilon zeta", start)]})
+        try:
+            asyncio.run(scheduler._fonbet_tick_inner(None))
+            line = [m for m in rec.sent if "ЛИНИЮ" in m["text"]]
+            check("Тихие часы у одного, заглушенный матч у другого → уведомление никому не ушло, но матч найден",
+                  (not line or line[0]["to"] == []) and env.sched()[0].fonbet_matched)
+        finally:
+            restore()
+
+    # Фонбет молчит → здоровье
+    with _Env() as env:
+        pred = models.Prediction(text=pred_text, match_time=start, source="manual")
+        storage.save_predictions(predictions=[pred])
+        rec, calls, restore = _tick_env({"en": []})
+        try:
+            for _ in range(health.FONBET_FAIL_STREAK):
+                asyncio.run(scheduler._fonbet_tick_inner(None))
+            check("Фонбет вернул пусто 5 тиков подряд → счётчик неудач в health",
+                  health.snapshot()["fonbet"]["streak"] == health.FONBET_FAIL_STREAK)
+        finally:
+            restore()
+
+
+def test_scheduler_miss_journal():
+    print("\n[Планировщик: журнал «почему не нашёл»]")
+    now = datetime.utcnow()
+    start = (now + timedelta(minutes=5)).replace(second=0, microsecond=0)
+    pred_text = "Poland. 4 Liga. Warmia 16-00 alpha beta gamma — delta epsilon zeta п1 2+"
+    with _Env() as env:
+        pred = models.Prediction(text=pred_text, match_time=start, source="manual")
+        storage.save_predictions(predictions=[pred])
+        rec, calls, restore = _tick_env({"en": [_utc_event("alpha beta gamma", "delta epsilon zeta", start + timedelta(minutes=45))]})
+        try:
+            asyncio.run(scheduler._fonbet_tick_inner(None))
+            check("Промах в тике: причина записана в память (время не то)", scheduler._last_diag[pred.id]["reason"] == "time")
+            asyncio.run(scheduler._fonbet_tick_inner(None))
+            check("Подробная диагностика не чаще раза в пару минут (второй тик её не пересчитывает)",
+                  len(scheduler._diag_ts) == 1)
+            storage.update_prediction(pred_id=pred.id, match_time=now - timedelta(minutes=30))
+            asyncio.run(scheduler.notification_tick(None))
+            miss = storage.journal_recent(5, "miss")
+            check("Матч ушёл из расписания ненайденным → промах в журнале с причиной и кандидатами",
+                  len(miss) == 1 and miss[0]["reason"] == "time" and "45 мин" in miss[0]["why"] and miss[0]["best"])
+            check("Прогноз из расписания удалён", env.sched() == [])
+        finally:
+            restore()
+    with _Env() as env:
+        found = models.Prediction(text=pred_text, match_time=now - timedelta(minutes=30), source="manual", fonbet_matched=True)
+        storage.save_predictions(predictions=[found])
+        rec, calls, restore = _tick_env({"en": []})
+        try:
+            asyncio.run(scheduler.notification_tick(None))
+            check("Найденный ранее матч при чистке в журнал промахов не попадает", storage.journal_recent(5, "miss") == [])
+        finally:
+            restore()
+    with _Env() as env:
+        rec, calls, restore = _tick_env({"en": []})
+        try:
+            tz_pred = models.Prediction(text=pred_text, match_time=(now + timedelta(minutes=30)).replace(second=0, microsecond=0), source="manual")
+            storage.save_predictions(predictions=[tz_pred])
+            storage.update_settings(222, lambda s: setattr(s, "notify_reminders", True))
+            asyncio.run(scheduler.notification_tick(None))
+            r = [m for m in rec.sent if "30" in m["text"] or "мин" in m["text"]]
+            check("Напоминание за 30 минут приходит получателям и несёт прогноз для кнопок", r and r[0]["pred"] == tz_pred.id)
+            storage.update_settings(222, lambda s: s.blocked_countries.append("poland"))
+            storage.update_prediction(pred_id=tz_pred.id, notified_30=False)
+            rec.sent.clear()
+            asyncio.run(scheduler.notification_tick(None))
+            check("Напоминание не уходит тем, кто заблокировал страну", all(222 not in m["to"] for m in rec.sent) and rec.sent)
+        finally:
+            restore()
+
+
+def test_handlers_pure_bits():
+    print("\n[Кнопки: callback_data в лимите Telegram]")
+    check("mute|<id> короткий", len(f"mute|{models.Prediction(text='t', match_time=L(20,12)).id}".encode()) <= 64)
+    mid = "1234567890123456789"
+    item = {"mid": mid, "h8": storage._h8("ключ"), "text": "t"}
+    check("ud|<19-значный id>|<h8>|<ГГММДД> укладывается в 64 байта",
+          all(len(b[1].encode()) <= 64 for b in storage.ud_buttons(item, now=L(20, 12), tz=TZ)))
+
+
+def test_handlers_smoke():
+    print("\n[Команды и кнопки: прогон на заглушках Telegram]")
+    from unittest.mock import AsyncMock, MagicMock
+    import handlers
+
+    def upd(uid=5, args=None, text=None):
+        u = MagicMock()
+        u.effective_user.id = uid
+        u.message.reply_text = AsyncMock()
+        c = MagicMock()
+        c.args = args or []
+        return u, c
+
+    def said(u):
+        return " ".join(str(c.args[0]) for c in u.message.reply_text.call_args_list)
+
+    class _FixedDT(datetime):          # «сейчас» = 20.10 12:00 МСК, не зависит от часов машины
+        @classmethod
+        def utcnow(cls):
+            return L(20, 12)
+    real_dt = handlers.datetime
+    handlers.datetime = _FixedDT
+    now = L(20, 12)
+    with _Env() as env:
+        p1 = models.Prediction(text=M("18:00", "Альфа", "Бета"), match_time=now + timedelta(minutes=20), fonbet_matched=True, fonbet_state="line")
+        p2 = models.Prediction(text="Poland. 4 Liga. 20-00 Gamma — Delta п1 2+", match_time=now + timedelta(minutes=300))
+        storage.save_predictions(predictions=[p1, p2])
+
+        u, c = upd()
+        asyncio.run(handlers.cmd_today(u, c))
+        out = said(u)
+        check("/today: показывает матчи и статус «в линии»", "в линии" in out and "ещё рано" in out)
+
+        u, c = upd(args=["23", "8"]); asyncio.run(handlers.cmd_quiet(u, c))
+        s = storage.load_settings(5)
+        check("/quiet 23 8 сохраняет тихие часы", (s.quiet_from, s.quiet_to) == (23, 8) and "23:00" in said(u))
+        u, c = upd(args=[]); asyncio.run(handlers.cmd_quiet(u, c))
+        check("/quiet без аргументов показывает текущие", "23:00" in said(u))
+        u, c = upd(args=["off"]); asyncio.run(handlers.cmd_quiet(u, c))
+        check("/quiet off выключает", storage.load_settings(5).quiet_from is None)
+        u, c = upd(args=["99"]); asyncio.run(handlers.cmd_quiet(u, c))
+        check("/quiet с мусором — подсказка формата", "Формат" in said(u))
+
+        u, c = upd(args=["Poland"]); asyncio.run(handlers.cmd_block(u, c))
+        check("/block Poland", storage.load_settings(5).blocked_countries == ["poland"])
+        u, c = upd(args=["poland"]); asyncio.run(handlers.cmd_block(u, c))
+        check("Повторный /block не дублирует", storage.load_settings(5).blocked_countries == ["poland"])
+        u, c = upd(); asyncio.run(handlers.cmd_today(u, c))
+        check("/today помечает заблокированную страну 🚫", "🚫" in said(u))
+        u, c = upd(args=[]); asyncio.run(handlers.cmd_block(u, c))
+        check("/block без аргумента — список", "Poland" in said(u))
+        u, c = upd(args=["Poland"]); asyncio.run(handlers.cmd_unblock(u, c))
+        check("/unblock", storage.load_settings(5).blocked_countries == [])
+
+        # кнопки
+        def cb(data, uid=5):
+            q = MagicMock(); q.data = data; q.from_user.id = uid
+            q.answer = AsyncMock(); q.edit_message_text = AsyncMock(); q.message.text = ""
+            u = MagicMock(); u.callback_query = q
+            return u, q
+        u, q = cb(f"mute|{p1.id}")
+        asyncio.run(handlers.on_callback(u, MagicMock()))
+        check("Кнопка «Заглушить матч»: сохранено и показан тост", p1.id in storage.load_settings(5).muted_ids and q.answer.await_count == 1)
+        u, c = upd(); asyncio.run(handlers.cmd_today(u, c))
+        check("/today помечает заглушённый матч 🔕", "🔕" in said(u))
+        u, q = cb(f"blk|{p2.id}")
+        asyncio.run(handlers.on_callback(u, MagicMock()))
+        check("Кнопка «🚫 страна»: страна заблокирована", "poland" in storage.load_settings(5).blocked_countries)
+        u, q = cb("blk|нетакого")
+        asyncio.run(handlers.on_callback(u, MagicMock()))
+        check("Кнопка по завершённому матчу — понятное сообщение, без падения", q.answer.await_count == 1)
+        u, c = upd(); asyncio.run(handlers.cmd_unmute(u, c))
+        check("/unmute очищает заглушённые", storage.load_settings(5).muted_ids == [])
+
+        # диагностика
+        health.reset()
+        u, c = upd(); asyncio.run(handlers.cmd_status(u, c))
+        out = said(u)
+        check("/status: есть Фонбет, Discord, расписание, журнал", all(k in out for k in ("Фонбет", "Discord", "Расписание", "Журнал")))
+        storage.journal_add({"kind": "miss", "text": "тест", "match_time": now.isoformat(), "reason": "time",
+                             "why": "время старта отличается на 40 мин", "best": [{"score": 90, "match": "A — B", "league": "L", "why": "время"}]})
+        u, c = upd(); asyncio.run(handlers.cmd_misses(u, c))
+        check("/misses: причина и кандидаты", "40 мин" in said(u) and "90%" in said(u))
+        u, c = upd(args=["found"]); asyncio.run(handlers.cmd_misses(u, c))
+        check("/misses found: без записей — понятный текст", "Найденных пока нет" in said(u))
+        storage.add_aliases([("Dinamo", "Dynamo")])
+        u, c = upd(); asyncio.run(handlers.cmd_aliases(u, c))
+        check("/aliases", "Dinamo" in said(u))
+        u, c = upd(args=["dinamo"]); asyncio.run(handlers.cmd_unalias(u, c))
+        check("/unalias", "удалён" in said(u) and storage.list_aliases() == [])
+
+        # неопределённая дата: команда и кнопка
+        snp = snap(80, L(20, 11), M("14:00", "Х", "У"), edited=L(20, 23))
+        env.apply([snp], now=L(20, 23, 5))
+        u, c = upd(); asyncio.run(handlers.cmd_undetermined(u, c))
+        check("/undetermined: вопрос с кнопками", u.message.reply_text.await_count == 1 and "Когда он играет" in said(u))
+        item = storage.list_undetermined()[0]
+        u, q = cb(storage.ud_buttons(item, now=now, tz=TZ)[2][1])
+        asyncio.run(handlers.on_callback(u, MagicMock()))
+        check("Кнопка «Пропустить» снимает вопрос и редактирует сообщение",
+              storage.list_undetermined() == [] and q.edit_message_text.await_count == 1)
+    handlers.datetime = real_dt
+
+
+def test_commands_registry():
+    print("\n[/commands: реестр команд совпадает с bot.py]")
+    import re as _re
+    import handlers
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.py"), encoding="utf-8").read()
+    registered = set()
+    for m in _re.finditer(r'CommandHandler\(\s*(\[[^\]]*\]|"[^"]+")', src):
+        registered |= set(_re.findall(r'"([a-z_]+)"', m.group(1)))
+    names = handlers.all_command_names()
+    # «comands» — синоним-опечатка, в справке отдельной строкой не нужен
+    check("Все команды из bot.py есть в реестре /commands: " + (", ".join(sorted(registered - names - {"comands"})) or "ок"),
+          (registered - {"comands"}) <= names)
+    check("В реестре нет команд, которых бот не регистрирует: " + (", ".join(sorted(names - registered)) or "ок"),
+          names <= registered)
+    check("/comands и /commands зарегистрированы вместе", {"commands", "comands"} <= registered)
+    missing = [n for n in names if not hasattr(handlers, f"cmd_{n}")]
+    check("У каждой команды из реестра есть обработчик cmd_*: " + (", ".join(missing) or "ок"), not missing)
+    allc = list(handlers.COMMANDS_USER) + [c for _t, items in handlers.COMMANDS_ADMIN for c in items]
+    check("У каждой команды есть описание", all(c[2].strip() for c in allc))
+    check("Имена команд в реестре не повторяются", len([c[0] for c in allc]) == len(set(c[0] for c in allc)))
+
+    user_txt = handlers.build_commands_text(False)
+    admin_txt = handlers.build_commands_text(True)
+    check("Обычному пользователю: его команды есть, админских нет",
+          "/today" in user_txt and "/quiet" in user_txt and "/status" not in user_txt and "/ban" not in user_txt)
+    check("Админу: показаны и пользовательские, и все админские",
+          all(f"/{n}" in admin_txt for n in names))
+    check("Текст влезает в одно сообщение Telegram (<4096)", len(admin_txt) < 4096)
+
+    from unittest.mock import AsyncMock, MagicMock
+    u = MagicMock(); u.effective_user.id = 5; u.message.reply_text = AsyncMock()
+    asyncio.run(handlers.cmd_commands(u, MagicMock()))
+    check("/commands отвечает одним сообщением", u.message.reply_text.await_count == 1
+          and "Все команды" in u.message.reply_text.call_args.args[0])
+
+
 if __name__ == "__main__":
     print("=" * 50)
     print("ТЕСТЫ BET BOT")
@@ -1278,6 +1886,17 @@ if __name__ == "__main__":
     test_fonbet_matching_tiers()
     test_league_detection()
     test_monitor_window_retention()
+    test_models_new_fields()
+    test_health_alerts()
+    test_userprefs()
+    test_fonbet_aliases_diag()
+    test_storage_journal_aliases_settings()
+    test_undetermined_buttons_flow()
+    test_scheduler_fonbet_tick_integration()
+    test_scheduler_miss_journal()
+    test_handlers_pure_bits()
+    test_handlers_smoke()
+    test_commands_registry()
 
     print("\n" + "=" * 50)
     print(f"Пройдено: {_passed}  |  Провалено: {_failed}")

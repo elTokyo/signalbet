@@ -28,6 +28,20 @@ FALLBACK_HOSTS = [
 # Без version отдаются только что-то изменившиеся события (обычно только live).
 ENDPOINT_PATH = "/ma/events/list?lang=en&scopeMarket=1600&version=0"
 
+def _endpoint_url(host: str, lang: str = "en") -> str:
+    """URL списка событий на нужном языке (en/ru). Названия лиг и команд приходят на этом языке."""
+    return f"https://{host}{ENDPOINT_PATH.replace('lang=en', f'lang={lang}')}"
+
+
+# Причина последнего неудачного запроса — для алертов и /status (None = последний был успешным)
+LAST_ERROR: dict = {"msg": None, "ts": None}
+
+
+def _set_error(msg: Optional[str]):
+    LAST_ERROR["msg"] = msg
+    LAST_ERROR["ts"] = time.time() if msg else None
+
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -307,20 +321,23 @@ def league_matches(pred_text: str, league_name: Optional[str]) -> bool:
 
 # ── Запрос событий ───────────────────────────────────────────────────────────
 
-def fetch_events() -> list[dict]:
+def fetch_events(lang: str = "en") -> list[dict]:
     """
     Запрашивает все футбольные события (prematch + live) с коэффициентами П1/П2.
-    Возвращает список словарей: {team1, team2, is_live, odd_p1, odd_p2}
+    lang — язык названий команд/лиг («en» по умолчанию, «ru» — для прогнозов на русском).
+    Возвращает список словарей: {team1, team2, is_live, odd_p1, odd_p2, league_name, ...}
     """
     host = get_working_host()
     if not host:
+        _set_error("нет рабочего хоста Фонбета")
         return []
 
-    url = f"https://{host}{ENDPOINT_PATH}"
+    url = _endpoint_url(host, lang)
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
         if r.status_code != 200:
-            logger.warning(f"Fonbet API {r.status_code}")
+            logger.warning(f"Fonbet API {r.status_code} (lang={lang})")
+            _set_error(f"HTTP {r.status_code}")
             # Сбрасываем кэш URL — возможно хост умер
             with _url_lock:
                 _url_cache["ts"] = 0
@@ -328,16 +345,19 @@ def fetch_events() -> list[dict]:
         data = r.json()
     except Exception as e:
         logger.error(f"Fonbet fetch error: {e}")
+        _set_error(str(e)[:120])
         with _url_lock:
             _url_cache["ts"] = 0
         return []
 
     raw_events = data.get("events", [])
-    logger.info(f"Fonbet raw events: {len(raw_events)}")
+    logger.info(f"Fonbet raw events: {len(raw_events)} (lang={lang})")
 
     if not raw_events:
         logger.warning(f"Fonbet: нет events. Ключи ответа: {list(data.keys())[:20]}")
+        _set_error("в ответе нет events")
         return []
+    _set_error(None)
 
     # Берём ВСЕ события у которых есть две команды.
     # Фильтр по виду спорта не нужен: бот ищет конкретные команды через fuzzy,
@@ -600,71 +620,112 @@ def _age_markers_compatible(pred_text: str, ev_team1: str, ev_team2: str) -> boo
     return pred_marker == ev_marker
 
 
+def prediction_script(text: str) -> str:
+    """'ru', если заголовок/команды прогноза в основном кириллицей, иначе 'en'."""
+    t1, t2 = extract_teams_from_prediction(text)
+    s = f"{prediction_league_header(text)} {t1} {t2}".lower()
+    cyr = len(re.findall(r'[а-яё]', s))
+    lat = len(re.findall(r'[a-z]', s))
+    return "ru" if cyr > lat else "en"
+
+
+def alias_norm(name: str) -> str:
+    """Нормализация названия команды для словаря алиасов: только буквы/цифры, нижний регистр."""
+    return re.sub(r'[\W_]+', '', (name or "").lower())
+
+
+def _side_score(p: str, e: str, aliases: Optional[dict]) -> float:
+    """Сходство названий одной команды; подтверждённая ранее пара (алиас) = 100."""
+    if aliases:
+        known = aliases.get(alias_norm(p))
+        if known and alias_norm(e) in known:
+            return 100.0
+    return fuzz.token_sort_ratio(p, e)
+
+
+def _pair_score(p1: str, p2: str, e1: str, e2: str, aliases: Optional[dict]):
+    """(счёт, ((назв.прогноза, назв.события, счёт стороны), ...)) для лучшей ориентации."""
+    if not p2:
+        s = _side_score(p1, e1, aliases)
+        return s, ((p1, e1, s),)
+    d1, d2 = _side_score(p1, e1, aliases), _side_score(p2, e2, aliases)
+    r1, r2 = _side_score(p1, e2, aliases), _side_score(p2, e1, aliases)
+    direct, reverse = (d1 + d2) / 2, (r1 + r2) / 2
+    if direct >= reverse:
+        return direct, ((p1, e1, d1), (p2, e2, d2))
+    return reverse, ((p1, e2, r1), (p2, e1, r2))
+
+
+def _event_start(ev: dict):
+    import datetime as _dt
+    raw = ev.get("start_time")
+    if not raw:
+        return None
+    try:
+        return _dt.datetime.utcfromtimestamp(int(raw))
+    except (ValueError, TypeError, OSError):
+        return None
+
+
 def find_matching_event(pred_text: str, events: list[dict],
-                        expected_utc=None, time_tolerance_min: int = 15) -> Optional[dict]:
+                        expected_utc=None, time_tolerance_min: int = 15,
+                        diag: Optional[dict] = None,
+                        aliases: Optional[dict] = None) -> Optional[dict]:
     """
     Ищет матч из прогноза среди событий Фонбета.
-    Возвращает событие (копию с полями match_score и match_tier) или None.
+    Возвращает событие (копию с полями match_score, match_tier, alias_pairs) или None.
 
-    Два уровня совпадения названий команд (token_sort_ratio, среднее по двум командам):
+    Порядок: СНАЧАЛА время старта (дёшево, отсекает почти все события), потом названия
+    команд, потом возрастной маркер. Результат тот же, что при любом порядке, но fuzzy
+    считается только по событиям из окна времени — на порядки быстрее и без ложных
+    срабатываний на однофамильных командах в другое время.
+
+    Два уровня совпадения названий (token_sort_ratio, среднее по двум командам):
       • base       — не ниже FUZZY_THRESHOLD (60);
       • same_slot  — не ниже FUZZY_THRESHOLD_SAME_SLOT (50), но только если матч стартует
-                     в указанное по прогнозу время И страна/лига события совпадают с
-                     прогнозом (league_matches). Уровень нужен для случаев, когда названия
-                     сильно отличаются, а время и лига сходятся — это почти наверняка он.
-    Для обоих уровней обязательны: совместимый возрастной маркер и время старта
-    (±time_tolerance_min), если expected_utc задан. same_slot без expected_utc невозможен.
-    Если матч принят только по same_slot и есть второй кандидат почти с тем же счётом
-    (SAME_SLOT_AMBIGUITY_GAP) — выбор неоднозначен, матч считается не найденным.
-    """
-    import datetime as _dt
+                     в указанное по прогнозу время (±time_tolerance_min) И страна/лига
+                     события совпадают с прогнозом (league_matches).
+    Для обоих уровней обязательны: время старта (если expected_utc задан) и совместимый
+    возрастной маркер. same_slot без expected_utc невозможен.
+    Если матч принят только по same_slot и второй кандидат отстаёт меньше чем на
+    SAME_SLOT_AMBIGUITY_GAP — выбор неоднозначен, матч считается не найденным.
 
+    aliases — подтверждённые пары названий {alias_norm(прогноз): [alias_norm(событие), ...]};
+    известная пара даёт 100% для этой команды (см. storage.load_aliases).
+    diag — если передан dict и матч не найден, в него кладётся причина (см. _explain_miss).
+    В alias_pairs результата лежат пары, которые стоит запомнить (уверенный матч, но
+    названия различались) — запись делает вызывающий код.
+    """
     pred_t1, pred_t2 = extract_teams_from_prediction(pred_text)
     if not pred_t1:
+        if diag is not None:
+            diag.update(reason="no_teams", text="в прогнозе не удалось выделить команды", best=[])
         return None
 
     p1 = pred_t1.lower()
     p2 = pred_t2.lower() if pred_t2 else ""
 
-    candidates = []  # (score, event, tier)
+    candidates = []  # (score, event, tier, sides)
 
     for ev in events:
-        e1 = ev["team1"].lower()
-        e2 = ev["team2"].lower()
+        # 1. время старта
+        if expected_utc is not None:
+            ev_start = _event_start(ev)
+            if ev_start is None:
+                continue
+            if abs((ev_start - expected_utc).total_seconds()) / 60 > time_tolerance_min:
+                continue
 
-        if p2:
-            direct = (fuzz.token_sort_ratio(p1, e1) + fuzz.token_sort_ratio(p2, e2)) / 2
-            reverse = (fuzz.token_sort_ratio(p1, e2) + fuzz.token_sort_ratio(p2, e1)) / 2
-            score = max(direct, reverse)
-        else:
-            score = fuzz.token_sort_ratio(p1, e1)
-
+        # 2. названия команд
+        score, sides = _pair_score(p1, p2, ev["team1"].lower(), ev["team2"].lower(), aliases)
         if score < FUZZY_THRESHOLD_SAME_SLOT:
             continue
 
-        # ── ОБЯЗАТЕЛЬНАЯ проверка 1: возрастной/категорийный маркер ──
-        # Если в прогнозе U20, а событие про основу (или наоборот) — отвергаем.
+        # 3. возрастной/категорийный маркер: U20 ≠ основа, женские ≠ мужские
         if not _age_markers_compatible(pred_text, ev["team1"], ev["team2"]):
             continue
 
-        # ── ОБЯЗАТЕЛЬНАЯ проверка 2: время старта ──
-        # Время ДОЛЖНО совпасть (±tolerance). Если у события нет времени или
-        # оно не совпадает — отвергаем. Это убирает путаницу разных фикстур
-        # одних и тех же команд.
-        if expected_utc is not None:
-            ev_start_raw = ev.get("start_time")
-            if not ev_start_raw:
-                # У события нет времени — не можем подтвердить, отвергаем
-                continue
-            try:
-                ev_start = _dt.datetime.utcfromtimestamp(int(ev_start_raw))
-                diff_min = abs((ev_start - expected_utc).total_seconds()) / 60
-            except (ValueError, TypeError, OSError):
-                continue
-            if diff_min > time_tolerance_min:
-                continue
-
-        # ── Уровень совпадения названий ──
+        # Уровень совпадения названий
         if score >= FUZZY_THRESHOLD:
             tier = "base"
         elif expected_utc is not None and league_matches(pred_text, ev.get("league_name")):
@@ -672,13 +733,15 @@ def find_matching_event(pred_text: str, events: list[dict],
         else:
             continue
 
-        candidates.append((score, ev, tier))
+        candidates.append((score, ev, tier, sides))
 
     if not candidates:
+        if diag is not None:
+            diag.update(_explain_miss(pred_text, p1, p2, events, expected_utc, time_tolerance_min, aliases))
         return None
 
     candidates.sort(key=lambda c: c[0], reverse=True)
-    score, event, tier = candidates[0]
+    score, event, tier, sides = candidates[0]
 
     if tier == "same_slot" and len(candidates) > 1:
         runner_up = candidates[1][0]
@@ -689,7 +752,23 @@ def find_matching_event(pred_text: str, events: list[dict],
                 f"'{candidates[1][1]['team1']} vs {candidates[1][1]['team2']}' ({runner_up:.0f}%) "
                 f"в той же лиге и в то же время — пропуск"
             )
+            if diag is not None:
+                diag.update(
+                    reason="ambiguous",
+                    text=(f"неоднозначно: «{event['team1']} — {event['team2']}» ({score:.0f}%) и "
+                          f"«{candidates[1][1]['team1']} — {candidates[1][1]['team2']}» ({runner_up:.0f}%) "
+                          f"в той же лиге и в то же время"),
+                    best=[],
+                )
             return None
+
+    # Что запомнить: сторона с различающимся названием, если матч подтверждён уверенно
+    pairs = []
+    if len(sides) == 2:
+        (pa, ea, sa), (pb, eb, sb) = sides
+        for (pn, en, sc), other in (((pa, ea, sa), sb), ((pb, eb, sb), sa)):
+            if sc < 90 and (tier == "same_slot" or other >= 70):
+                pairs.append((pn, en))
 
     logger.info(
         f"Fonbet match [{score:.0f}%, {tier}]: "
@@ -698,7 +777,54 @@ def find_matching_event(pred_text: str, events: list[dict],
         f"({'LIVE' if event['is_live'] else 'LINE'}, признак: {event.get('live_reason')}"
         f"{', лига: ' + event['league_name'] if event.get('league_name') else ''})"
     )
-    return dict(event, match_score=round(score), match_tier=tier)
+    return dict(event, match_score=round(score), match_tier=tier, alias_pairs=pairs)
+
+
+def _explain_miss(pred_text: str, p1: str, p2: str, events: list[dict], expected_utc,
+                  tol: int, aliases: Optional[dict]) -> dict:
+    """
+    Почему матч не найден: три самых похожих по названиям события и причина отказа для
+    каждого. Считает названия по ВСЕМ событиям (дорого), поэтому вызывается только при
+    промахе и не чаще, чем раз в пару минут на прогноз (см. scheduler).
+    """
+    if not events:
+        return {"reason": "no_events", "text": "список событий Фонбета пуст", "best": []}
+
+    rows = []
+    for ev in events:
+        score, _s = _pair_score(p1, p2, ev["team1"].lower(), ev["team2"].lower(), aliases)
+        if score >= 30:
+            rows.append((score, ev))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    if not rows:
+        return {"reason": "no_similar", "text": "похожих команд на Фонбете нет (ни одна пара не набрала и 30%)", "best": []}
+
+    best = []
+    for score, ev in rows[:3]:
+        code, why = "name", ""
+        ev_start = _event_start(ev) if expected_utc is not None else None
+        if expected_utc is not None and ev_start is None:
+            code, why = "time", "у события нет времени старта"
+        elif expected_utc is not None and abs((ev_start - expected_utc).total_seconds()) / 60 > tol:
+            diff = abs((ev_start - expected_utc).total_seconds()) / 60
+            code, why = "time", f"время старта отличается на {diff:.0f} мин (допуск {tol})"
+        elif score < FUZZY_THRESHOLD_SAME_SLOT:
+            code, why = "name", f"названия {score:.0f}% — ниже {FUZZY_THRESHOLD_SAME_SLOT}%"
+        elif not _age_markers_compatible(pred_text, ev["team1"], ev["team2"]):
+            code, why = "age", "не совпал возрастной/женский маркер"
+        elif score < FUZZY_THRESHOLD:
+            lg = ev.get("league_name")
+            if expected_utc is None:
+                code, why = "name", f"названия {score:.0f}% — ниже {FUZZY_THRESHOLD}%, а времени прогноза нет"
+            elif not lg:
+                code, why = "league", f"названия {score:.0f}% (<{FUZZY_THRESHOLD}%), лига события неизвестна — пониженный порог не применим"
+            else:
+                code, why = "league", f"названия {score:.0f}% (<{FUZZY_THRESHOLD}%), страна/лига не совпали (у события: {lg})"
+        else:
+            code, why = "other", "подходит, но отброшен (см. лог)"
+        best.append({"score": round(score), "match": f"{ev['team1']} — {ev['team2']}",
+                     "league": ev.get("league_name"), "code": code, "why": why})
+    return {"reason": best[0]["code"], "text": best[0]["why"], "best": best}
 
 
 # ── Определение «кривого» (value) матча ──────────────────────────────────────
