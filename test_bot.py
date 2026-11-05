@@ -1824,11 +1824,11 @@ def test_commands_registry():
         registered |= set(_re.findall(r'"([a-z_]+)"', m.group(1)))
     names = handlers.all_command_names()
     # «comands» — синоним-опечатка, в справке отдельной строкой не нужен
-    check("Все команды из bot.py есть в реестре /commands: " + (", ".join(sorted(registered - names - {"comands"})) or "ок"),
-          (registered - {"comands"}) <= names)
+    check("Все команды из bot.py есть в реестре /commands: " + (", ".join(sorted(registered - names - handlers.COMMAND_ALIASES)) or "ок"),
+          (registered - handlers.COMMAND_ALIASES) <= names)
     check("В реестре нет команд, которых бот не регистрирует: " + (", ".join(sorted(names - registered)) or "ок"),
           names <= registered)
-    check("/comands и /commands зарегистрированы вместе", {"commands", "comands"} <= registered)
+    check("/commands, /comands и /help зарегистрированы вместе", {"commands", "comands", "help"} <= registered)
     missing = [n for n in names if not hasattr(handlers, f"cmd_{n}")]
     check("У каждой команды из реестра есть обработчик cmd_*: " + (", ".join(missing) or "ок"), not missing)
     allc = list(handlers.COMMANDS_USER) + [c for _t, items in handlers.COMMANDS_ADMIN for c in items]
@@ -1848,6 +1848,161 @@ def test_commands_registry():
     asyncio.run(handlers.cmd_commands(u, MagicMock()))
     check("/commands отвечает одним сообщением", u.message.reply_text.await_count == 1
           and "Все команды" in u.message.reply_text.call_args.args[0])
+
+
+import handlers
+import version
+
+
+def test_version_and_startup():
+    print("\n[Сборка: самопроверка комплекта файлов]")
+    check("Текущий комплект целый — проблем нет", version.check_consistency() == [])
+
+    saved = scheduler.health_tick
+    del scheduler.health_tick
+    try:
+        check("Устаревший scheduler.py (нет health_tick) → назван в проблемах", version.check_consistency() == ["scheduler.py"])
+    finally:
+        scheduler.health_tick = saved
+    saved_h = handlers.cmd_commands
+    del handlers.cmd_commands
+    try:
+        check("Старый handlers.py (нет cmd_commands) → назван в проблемах", "handlers.py" in version.check_consistency())
+    finally:
+        handlers.cmd_commands = saved_h
+    check("После восстановления снова всё хорошо", version.check_consistency() == [])
+
+    ok = version.startup_text(40, [])
+    bad = version.startup_text(40, ["scheduler.py", "fonbet.py"])
+    check("Стартовое сообщение: сборка и число обработчиков", version.BUILD in ok and "40" in ok and "/commands" in ok)
+    check("При проблемах в сообщении перечислены файлы и что делать",
+          "scheduler.py, fonbet.py" in bad and "целиком" in bad and "⚠️" in bad)
+
+
+def test_health_telegram_conflict():
+    print("\n[Здоровье: Conflict Telegram]")
+    health.reset()
+    t0 = _time.time() + 10_000
+    health.telegram_conflict(t0)
+    health.telegram_conflict(t0 + 5)
+    check("Один-два Conflict (как при редеплое) — не авария", health.evaluate(t0 + 10) == [])
+    health.telegram_conflict(t0 + 20)
+    ev = health.evaluate(t0 + 21)
+    check("Три за 2 минуты → одна тревога про второй экземпляр",
+          len(ev) == 1 and ev[0][0] == "telegram_conflict" and ev[0][1] == "raise" and "BOT_TOKEN" in ev[0][2])
+    health.telegram_conflict(t0 + 30)
+    check("Тревога не повторяется", health.evaluate(t0 + 31) == [])
+    ev = health.evaluate(t0 + 30 + health.TG_CONFLICT_WINDOW_SEC + 5)
+    check("Conflict прекратились → «конфликт ушёл»", len(ev) == 1 and ev[0][1] == "clear")
+    check("Счётчик за 10 минут для /status", health.telegram_conflicts_recent(600, t0 + 100) == 4)
+    health.reset()
+
+
+class _Err(Exception):
+    pass
+
+
+class Conflict(Exception):
+    pass
+
+
+class TimedOut(Exception):
+    pass
+
+
+def _err_ctx(err):
+    from unittest.mock import AsyncMock, MagicMock
+    ctx = MagicMock()
+    ctx.error = err
+    ctx.bot.send_message = AsyncMock()
+    return ctx
+
+
+def test_error_handler():
+    print("\n[Обработчик ошибок Telegram]")
+    from unittest.mock import MagicMock
+    handlers._ERR_SEEN.clear()
+    health.reset()
+
+    ctx = _err_ctx(Conflict("terminated by other getUpdates request"))
+    asyncio.run(handlers.on_error(None, ctx))
+    check("Conflict: админам не пишем, но учитываем для алерта",
+          ctx.bot.send_message.await_count == 0 and health.telegram_conflicts_recent() == 1)
+    ctx = _err_ctx(TimedOut("Timed out"))
+    asyncio.run(handlers.on_error(None, ctx))
+    check("Сетевой сбой: только лог, админам не пишем", ctx.bot.send_message.await_count == 0)
+
+    upd = MagicMock(); upd.callback_query = None; upd.message.text = "/list"
+    ctx = _err_ctx(_Err("что-то сломалось"))
+    asyncio.run(handlers.on_error(upd, ctx))
+    sent = [c.args[1] for c in ctx.bot.send_message.await_args_list]
+    check("Неожиданное исключение: админам уходит короткое сообщение с типом, текстом и командой",
+          len(sent) == len(storage.config.ADMIN_CHAT_IDS) and "_Err" in sent[0] and "/list" in sent[0])
+    ctx2 = _err_ctx(_Err("что-то сломалось"))
+    asyncio.run(handlers.on_error(upd, ctx2))
+    check("Та же ошибка повторно — не спамим (кулдаун)", ctx2.bot.send_message.await_count == 0)
+    ctx3 = _err_ctx(ValueError("другая"))
+    asyncio.run(handlers.on_error(None, ctx3))
+    check("Другая ошибка проходит", ctx3.bot.send_message.await_count == len(storage.config.ADMIN_CHAT_IDS))
+    cq = MagicMock(); cq.callback_query.data = "ud|1|abc|s"; cq.message = None
+    ctx4 = _err_ctx(KeyError("x"))
+    asyncio.run(handlers.on_error(cq, ctx4))
+    check("Для кнопки в сообщении указана callback_data", "ud|1|abc|s" in ctx4.bot.send_message.await_args_list[0].args[1])
+    health.reset()
+
+
+def test_unknown_command():
+    print("\n[Незнакомая команда: подсказка вместо молчания]")
+    from unittest.mock import AsyncMock, MagicMock
+
+    def mk(text, chat_type="private", bot_username="mybot"):
+        u = MagicMock()
+        u.effective_user.id = 5
+        u.effective_chat.type = chat_type
+        u.message.text = text
+        u.message.reply_text = AsyncMock()
+        c = MagicMock(); c.bot.username = bot_username
+        return u, c
+
+    def reply(u):
+        return u.message.reply_text.call_args.args[0] if u.message.reply_text.await_count else None
+
+    u, c = mk("/comand"); asyncio.run(handlers.cmd_unknown(u, c))
+    check("/comand → подсказка про /commands и /comands", "/commands" in reply(u) and "Возможно" in reply(u))
+    u, c = mk("/lsit"); asyncio.run(handlers.cmd_unknown(u, c))
+    check("Опечатка /lsit → предлагает /list", "/list" in reply(u).split("Возможно")[1])
+    u, c = mk("/qwertyuiop"); asyncio.run(handlers.cmd_unknown(u, c))
+    check("Совсем незнакомая — без «Возможно», но со ссылкой на список", "Возможно" not in reply(u) and "/commands" in reply(u))
+    u, c = mk("/foo@otherbot"); asyncio.run(handlers.cmd_unknown(u, c))
+    check("Команда адресована другому боту — молчим", reply(u) is None)
+    u, c = mk("/foo", chat_type="supergroup"); asyncio.run(handlers.cmd_unknown(u, c))
+    check("В группе чужую слэш-команду без @ — молчим", reply(u) is None)
+    u, c = mk("/foo@MyBot", chat_type="supergroup"); asyncio.run(handlers.cmd_unknown(u, c))
+    check("В группе, но адресовано нашему боту (регистр не важен) — отвечаем", reply(u) is not None)
+
+
+def test_command_menu_and_bot_wiring():
+    print("\n[Меню «/» и сборка приложения bot.py]")
+    import re as _re
+    for admin in (False, True):
+        menu = handlers.command_menu(admin)
+        names = [n for n, _d in menu]
+        check(f"Меню ({'админ' if admin else 'пользователь'}): имена допустимы для Telegram (a-z0-9_, ≤32), описания 1–256",
+              all(_re.fullmatch(r"[a-z0-9_]{1,32}", n) for n in names) and all(1 <= len(d) <= 256 for _n, d in menu))
+    user_names = {n for n, _d in handlers.command_menu(False)}
+    admin_names = {n for n, _d in handlers.command_menu(True)}
+    check("Пользовательское меню не содержит админских команд", not ({"ban", "status", "debug", "clear"} & user_names))
+    check("Админское меню — все команды из реестра", admin_names == handlers.all_command_names())
+    check("В меню нет дублей", len(handlers.command_menu(True)) == len(admin_names))
+
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.py"), encoding="utf-8").read()
+    last_cmd = max(m.start() for m in _re.finditer(r"CommandHandler\(", src))
+    unknown = src.index("filters.COMMAND, handlers.cmd_unknown")
+    check("Обработчик незнакомых команд зарегистрирован ПОСЛЕ всех CommandHandler (иначе перехватит свои)", unknown > last_cmd)
+    check("Зарегистрирован обработчик ошибок", "add_error_handler(handlers.on_error)" in src)
+    check("Стартовая самопроверка подключена (post_init)", "post_init(_on_startup)" in src and "check_consistency" in src)
+    check("Логи идут в stdout (иначе Railway помечает всё как error)", "stream=sys.stdout" in src)
+    check("/help — синоним /commands", '["commands", "comands", "help"]' in src)
 
 
 if __name__ == "__main__":
@@ -1897,6 +2052,11 @@ if __name__ == "__main__":
     test_handlers_pure_bits()
     test_handlers_smoke()
     test_commands_registry()
+    test_version_and_startup()
+    test_health_telegram_conflict()
+    test_error_handler()
+    test_unknown_command()
+    test_command_menu_and_bot_wiring()
 
     print("\n" + "=" * 50)
     print(f"Пройдено: {_passed}  |  Провалено: {_failed}")

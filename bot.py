@@ -1,4 +1,5 @@
 import logging
+import sys
 import threading
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
@@ -6,11 +7,15 @@ from telegram.ext import (
 
 import config
 import handlers
+import version
 from scheduler import setup_scheduler
 
+# stdout, а не stderr: Railway помечает всё из stderr как «error», и в логах нельзя
+# отфильтровать реальные ошибки — каждая строка выглядела бы одинаково.
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    stream=sys.stdout,
 )
 logger = logging.getLogger(__name__)
 
@@ -39,13 +44,34 @@ def start_discord_in_background():
     logger.info("Discord listener запущен в фоне")
 
 
+async def _on_startup(app: Application):
+    """
+    Вызывается один раз перед началом опроса Telegram: самопроверка комплекта файлов,
+    сообщение админам «бот запущен, сборка …» и публикация меню команд.
+    Если после выкладки этого сообщения нет — на сервере крутится старый код.
+    """
+    problems = version.check_consistency(check_discord=bool(config.DISCORD_TOKEN))
+    count = sum(len(v) for v in app.handlers.values())
+    if problems:
+        logger.error(f"Сборка {version.BUILD}: ФАЙЛЫ НЕ ОТ ЭТОЙ СБОРКИ: {', '.join(problems)}")
+    else:
+        logger.info(f"Сборка {version.BUILD}: комплект файлов целый, обработчиков: {count}")
+    text = version.startup_text(count, problems)
+    for admin_id in config.ADMIN_CHAT_IDS:
+        try:
+            await app.bot.send_message(admin_id, text)
+        except Exception as e:
+            logger.warning(f"Стартовое сообщение админу {admin_id} не отправлено: {e}")
+    await handlers.publish_command_menu(app.bot)
+
+
 def main():
     if not config.BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не задан")
 
     # Диагностика конфигурации при старте
     logger.info("=" * 50)
-    logger.info("Конфигурация бота:")
+    logger.info(f"Конфигурация бота (сборка {version.BUILD}):")
     logger.info(f"  ACCESS_PASSWORD: {'✅ задан' if config.ACCESS_PASSWORD else '❌ НЕ ЗАДАН (бот пустит всех!)'}")
     logger.info(f"  ADMIN_CHAT_IDS:  {config.ADMIN_CHAT_IDS or '❌ ПУСТО'}")
     logger.info(f"  GITHUB_TOKEN:    {'✅ задан' if config.GITHUB_TOKEN else '❌ НЕ ЗАДАН'}")
@@ -65,7 +91,7 @@ def main():
     else:
         logger.info(f"Админов: {len(config.ADMIN_CHAT_IDS)}")
 
-    app = Application.builder().token(config.BOT_TOKEN).build()
+    app = Application.builder().token(config.BOT_TOKEN).post_init(_on_startup).build()
 
     # Пользовательские команды
     app.add_handler(CommandHandler("start",    handlers.cmd_start))
@@ -88,7 +114,7 @@ def main():
     app.add_handler(CommandHandler("factors",     handlers.cmd_factors))
     app.add_handler(CommandHandler("bk",          handlers.cmd_bk))
     # /commands и опечатка-синоним /comands — один и тот же список
-    app.add_handler(CommandHandler(["commands", "comands"], handlers.cmd_commands))
+    app.add_handler(CommandHandler(["commands", "comands", "help"], handlers.cmd_commands))
     app.add_handler(CommandHandler("status",       handlers.cmd_status))
     app.add_handler(CommandHandler("misses",       handlers.cmd_misses))
     app.add_handler(CommandHandler("aliases",      handlers.cmd_aliases))
@@ -105,6 +131,10 @@ def main():
     # Кнопки + текст
     app.add_handler(CallbackQueryHandler(handlers.on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.on_text))
+    # Незнакомая слэш-команда: подсказка вместо молчания. ДОЛЖЕН идти после всех CommandHandler.
+    app.add_handler(MessageHandler(filters.COMMAND, handlers.cmd_unknown))
+    # Ошибки обработчиков и опроса Telegram — в лог одной строкой + алерт админам
+    app.add_error_handler(handlers.on_error)
 
     setup_scheduler(app)
     start_discord_in_background()

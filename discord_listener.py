@@ -471,6 +471,9 @@ def run_discord_listener():
     # но фиксируем явно чтобы не отвалилось при смене defaults в discord.py)
     intents.voice_states = True
 
+    # Голосовые *подключения* нам не нужны (только события входа/выхода), поэтому
+    # предупреждение «PyNaCl is not installed, voice will NOT be supported» — шум.
+    discord.VoiceClient.warn_nacl = False
     client = discord.Client(intents=intents)
 
     # ── Периодический перечит последних сообщений ────────────────────────────

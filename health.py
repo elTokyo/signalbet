@@ -22,6 +22,10 @@ DISCORD_DOWN_SEC = 180
 DISCORD_SYNC_STALE_SEC = 30 * 60
 # После старта процесса не тревожим: Discord/Фонбет ещё подключаются
 STARTUP_GRACE_SEC = 180
+# Conflict getUpdates: один-два при редеплое — норма (старый контейнер доживает секунды);
+# три и больше за окно — тот же BOT_TOKEN читает ещё кто-то
+TG_CONFLICT_COUNT = 3
+TG_CONFLICT_WINDOW_SEC = 120
 
 _lock = threading.RLock()
 _started_at = time.time()
@@ -31,6 +35,7 @@ _fonbet = {"last_ok": None, "last_fail": None, "streak": 0, "events": None,
 _discord = {"enabled": False, "connected": None, "since": None, "last_ready": None,
             "last_disconnect": None, "last_sync_ok": None, "last_sync_error": None,
             "last_sync_stats": None}
+_tg: dict = {"conflicts": []}   # времена ошибок Telegram Conflict (getUpdates)
 _alerts: dict = {}   # имя → {"since": ts}  (есть = активен)
 
 
@@ -43,6 +48,22 @@ def reset():
             for k in d:
                 d[k] = 0 if k == "streak" else (False if k == "enabled" else None)
         _alerts.clear()
+        _tg["conflicts"].clear()
+
+
+# ── Telegram ─────────────────────────────────────────────────────────────────
+
+def telegram_conflict(now: Optional[float] = None):
+    """Telegram вернул Conflict на getUpdates: тот же токен читает другой экземпляр бота."""
+    now = now or time.time()
+    with _lock:
+        _tg["conflicts"] = [t for t in _tg["conflicts"] if now - t < 600] + [now]
+
+
+def telegram_conflicts_recent(window: float = 600, now: Optional[float] = None) -> int:
+    now = now or time.time()
+    with _lock:
+        return sum(1 for t in _tg["conflicts"] if now - t <= window)
 
 
 # ── Фонбет ───────────────────────────────────────────────────────────────────
@@ -119,6 +140,16 @@ def _conditions(now: float) -> dict:
     """имя → (активно, текст аварии, текст восстановления)."""
     f, d = _fonbet, _discord
     out = {}
+
+    conflicts = sum(1 for t in _tg["conflicts"] if now - t <= TG_CONFLICT_WINDOW_SEC)
+    out["telegram_conflict"] = (
+        conflicts >= TG_CONFLICT_COUNT,
+        f"🚨 Telegram: Conflict ×{conflicts} за {TG_CONFLICT_WINDOW_SEC // 60} мин — этот же BOT_TOKEN одновременно "
+        f"читает другой экземпляр бота (старый деплой не остановился или запущен второй проект). "
+        f"Команды и кнопки будут отвечать вразнобой, уведомления могут дублироваться. "
+        f"Проверь Railway → Deployments.",
+        "✅ Конфликт Telegram ушёл: токен снова читает один экземпляр.",
+    )
 
     out["fonbet_down"] = (
         f["streak"] >= FONBET_FAIL_STREAK,

@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import logging
 import time
 from datetime import datetime, timedelta
@@ -11,6 +12,7 @@ import auth
 import config
 import health
 import userprefs
+import version
 from parser import parse_predictions, format_time_local, display_text_without_time
 
 logger = logging.getLogger(__name__)
@@ -132,7 +134,7 @@ async def _send_help(update: Update, user_id: int):
 
 COMMANDS_USER = [
     ("start",    "",                    "начало работы / ввод пароля"),
-    ("commands", "",                    "этот список (работает и /comands)"),
+    ("commands", "",                    "этот список (работает и /comands, /help)"),
     ("list",     "",                    "активные прогнозы"),
     ("today",    "",                    "матчи на сегодня и статус каждого на Фонбете"),
     ("settings", "",                    "часовой пояс и категории уведомлений"),
@@ -203,6 +205,112 @@ def build_commands_text(is_admin: bool) -> str:
 async def cmd_commands(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Выдаёт список всех команд (админам — с админскими). Также доступна как /comands."""
     await update.message.reply_text(build_commands_text(auth.is_admin(update.effective_user.id)))
+
+
+# Синонимы /commands, которые бот тоже понимает (в справке отдельной строкой не нужны)
+COMMAND_ALIASES = {"comands", "help"}
+
+
+def command_menu(is_admin: bool) -> list[tuple[str, str]]:
+    """[(имя, описание)] для меню «/» в Telegram. Обычным — свои команды, админам — все."""
+    items = [(c[0], c[2]) for c in COMMANDS_USER]
+    if is_admin:
+        for _title, group in COMMANDS_ADMIN:
+            items += [(c[0], c[2]) for c in group]
+    return [(n, d[:256]) for n, d in items]
+
+
+async def publish_command_menu(bot):
+    """
+    Публикует список команд в меню «/» Telegram (подсказки при вводе слэша):
+    всем — пользовательские, каждому админу — полный набор. Ошибки не критичны.
+    """
+    from telegram import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
+    try:
+        await bot.set_my_commands([BotCommand(n, d) for n, d in command_menu(False)],
+                                  scope=BotCommandScopeDefault())
+    except Exception as e:
+        logger.warning(f"set_my_commands (default) не удалось: {e}")
+    for admin_id in config.ADMIN_CHAT_IDS:
+        try:
+            await bot.set_my_commands([BotCommand(n, d) for n, d in command_menu(True)],
+                                      scope=BotCommandScopeChat(admin_id))
+        except Exception as e:   # админ мог ещё не писать боту — для него просто не будет расширенного меню
+            logger.warning(f"set_my_commands для админа {admin_id} не удалось: {e}")
+
+
+@require_auth
+async def cmd_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Незнакомая команда: вместо молчания — подсказка и ссылка на /commands.
+    В группах отвечаем только если команда адресована этому боту (/cmd@бот),
+    чужие слэш-команды (других ботов) игнорируем.
+    """
+    msg = update.message
+    parts = (msg.text or "").split()
+    if not parts:
+        return
+    name, _, target = parts[0].lstrip("/").partition("@")
+    if target and target.lower() != (getattr(ctx.bot, "username", "") or "").lower():
+        return
+    if not target and update.effective_chat.type != "private":
+        return
+    name = name.lower()
+    close = difflib.get_close_matches(name, sorted(all_command_names() | COMMAND_ALIASES), n=2, cutoff=0.6)
+    hint = f"\nВозможно, ты имел в виду: {', '.join('/' + c for c in close)}" if close else ""
+    await msg.reply_text(f"🤷 Не знаю команды /{name}.{hint}\nСписок всех команд: /commands")
+
+
+# Одинаковые ошибки не чаще раза в 10 минут шлём админам (иначе повторяющийся сбой завалит чат)
+_ERR_SEEN: dict = {}
+ERR_ALERT_COOLDOWN_SEC = 600
+
+
+async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Единый обработчик ошибок Telegram-части. Раньше его не было, и PTB печатал сырые трейсбеки
+    («No error handlers are registered»). Теперь:
+      • Conflict (тот же токен читает другой экземпляр) — одна строка в лог + учёт для алерта;
+      • сетевые сбои — предупреждение в одну строку;
+      • исключение в команде/кнопке — трейсбек в лог и короткое сообщение админам.
+    Тип проверяем по имени класса: так обработчик не зависит от импорта telegram.error.
+    """
+    err = ctx.error
+    name = type(err).__name__
+
+    if name == "Conflict":
+        health.telegram_conflict()
+        logger.warning("Telegram Conflict: тот же BOT_TOKEN читает ещё один экземпляр бота. "
+                       "При редеплое проходит за секунды; если повторяется — проверь Railway → Deployments")
+        return
+    if name in ("NetworkError", "TimedOut", "RetryAfter"):
+        logger.warning(f"Сеть Telegram ({name}): {err}")
+        return
+
+    logger.error("Необработанная ошибка в обработчике Telegram", exc_info=err)
+
+    key = (name, str(err)[:80])
+    now = time.time()
+    if now - _ERR_SEEN.get(key, 0) < ERR_ALERT_COOLDOWN_SEC:
+        return
+    _ERR_SEEN[key] = now
+
+    what = ""
+    try:
+        cq = getattr(update, "callback_query", None)
+        msg = getattr(update, "message", None)
+        if cq is not None and getattr(cq, "data", None):
+            what = f"\nКнопка: {cq.data[:60]}"
+        elif msg is not None and getattr(msg, "text", None):
+            what = f"\nСообщение: {msg.text[:60]}"
+    except Exception:
+        pass
+    text = f"⚠️ Ошибка в боте: {name}: {str(err)[:200]}{what}\nПодробности — в логах Railway."
+    for admin_id in config.ADMIN_CHAT_IDS:
+        try:
+            await ctx.bot.send_message(admin_id, text)
+        except Exception as e:
+            logger.error(f"Не удалось отправить алерт об ошибке админу {admin_id}: {e}")
 
 
 # ── Команды чтения (доступны всем авторизованным) ────────────────────────────
@@ -1199,8 +1307,9 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Расписание: {len(preds)} прогнозов (из Discord: {from_dc}), найдено на Фонбете: {matched}\n"
         f"Матчей без даты ждут решения: {undetermined}" + (" → /undetermined" if undetermined else "") + "\n"
         f"Журнал матчинга: найдено {stats['found']}, промахов {stats['miss']} → /misses\n"
+        f"Telegram: конфликтов getUpdates за 10 мин: {health.telegram_conflicts_recent()}\n"
         f"Активные тревоги: {alerts}\n"
-        f"Аптайм: {health._fmt_dur(now - snap['started_at'])}"
+        f"Сборка: {version.BUILD} · аптайм: {health._fmt_dur(now - snap['started_at'])}"
     )
     await update.message.reply_text(text)
 
