@@ -14,7 +14,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-BUILD = "2026-11-05.4"
+BUILD = "2026-11-05.5"
 
 
 def _has(mod, *names) -> bool:
@@ -39,7 +39,7 @@ def check_consistency(check_discord: bool = True) -> list[str]:
             problems.append(filename)
 
     check("models.py", "models", lambda m: {"fonbet_matched", "msg_id"} <= set(m.Prediction.__dataclass_fields__)
-          and "muted_ids" in m.UserSettings.__dataclass_fields__)
+          and "quiet_from" in m.UserSettings.__dataclass_fields__)
     check("match_dates.py", "match_dates", lambda m: _has(m, "retention_minutes", "resolve_match_datetime"))
     check("parser.py", "parser", lambda m: _has(m, "split_blocks", "extract_raw_matches"))
     check("fonbet.py", "fonbet", lambda m: _has(m, "LAST_ERROR", "prediction_script", "league_matches"))

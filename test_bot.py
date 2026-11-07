@@ -1260,12 +1260,13 @@ def test_models_new_fields():
     check("fonbet_matched/state переживают to_dict → from_dict",
           models.Prediction.from_dict(p.to_dict()).fonbet_state == "live")
     s = models.UserSettings.from_dict({"chat_id": 1})
-    check("Старые настройки: фильтры пустые", s.quiet_from is None and s.muted_ids == [] and s.blocked_countries == [])
-    s2 = models.UserSettings(chat_id=1, quiet_from=23, quiet_to=8, muted_ids=["x"], blocked_countries=["poland"])
-    r = models.UserSettings.from_dict(s2.to_dict())
-    check("Тихие часы, заглушки и страны переживают сохранение",
-          (r.quiet_from, r.quiet_to, r.muted_ids, r.blocked_countries) == (23, 8, ["x"], ["poland"]))
-    check("Списки не общие между экземплярами", models.UserSettings(chat_id=1).muted_ids is not models.UserSettings(chat_id=2).muted_ids)
+    check("Старые настройки: тихие часы выключены", s.quiet_from is None and s.quiet_to is None)
+    r = models.UserSettings.from_dict(models.UserSettings(chat_id=1, quiet_from=23, quiet_to=8).to_dict())
+    check("Тихие часы переживают сохранение", (r.quiet_from, r.quiet_to) == (23, 8))
+    legacy = models.UserSettings.from_dict({"chat_id": 1, "muted_ids": ["x"], "blocked_countries": ["poland"]})
+    check("Заглушка матчей и блокировка стран удалены: лишние ключи в старых данных не мешают",
+          legacy.chat_id == 1 and not hasattr(legacy, "muted_ids") and not hasattr(legacy, "blocked_countries")
+          and "muted_ids" not in legacy.to_dict())
 
 
 def test_health_alerts():
@@ -1316,7 +1317,7 @@ def test_health_alerts():
 
 
 def test_userprefs():
-    print("\n[Личные фильтры: тихие часы, страны, заглушка]")
+    print("\n[Личный фильтр: тихие часы, статус матча]")
     q = userprefs.in_quiet_hours
     at = lambda h, m=0: L(20, h, m)         # локальное (МСК) время → UTC
     check("Тихие часы 23→8: 23:30 внутри", q(23, 8, at(23, 30), 3))
@@ -1333,23 +1334,16 @@ def test_userprefs():
     check("/quiet 25 8 и 5 5 — ошибка", userprefs.parse_quiet_args(["25", "8"])[0] == "error"
           and userprefs.parse_quiet_args(["5", "5"])[0] == "error" and userprefs.parse_quiet_args(["a", "b"])[0] == "error")
 
-    check("Страна из прогноза (англ.)", userprefs.country_key("Poland. 4 Liga. Warmia 16-00 A — B") == "poland")
-    check("Страна из прогноза (рус., с «Футбол.»)", userprefs.country_key("Футбол. Нигерия. Кубок. 18-00 А — Б") == "нигерия")
-    check("Страна со скобками", userprefs.country_key("Myanmar (Burma). Youth 15-00 A — B") == "myanmar burma")
-
-    pred = models.Prediction(text="Poland. 4 Liga. 16-00 A — B", match_time=L(20, 16))
     base = models.UserSettings(chat_id=1)
-    now = L(20, 12)
-    check("Без фильтров можно слать", userprefs.user_allows(base, pred, now))
-    check("Заглушённый матч — нельзя", not userprefs.user_allows(models.UserSettings(chat_id=1, muted_ids=[pred.id]), pred, now))
-    check("Заблокированная страна — нельзя",
-          not userprefs.user_allows(models.UserSettings(chat_id=1, blocked_countries=["poland"]), pred, now))
-    check("Другая страна заблокирована — можно",
-          userprefs.user_allows(models.UserSettings(chat_id=1, blocked_countries=["germany"]), pred, now))
-    check("Тихие часы — нельзя",
-          not userprefs.user_allows(models.UserSettings(chat_id=1, quiet_from=23, quiet_to=8), pred, L(20, 2)))
-    check("Тихие часы действуют и на сообщения без прогноза (pred=None)",
-          not userprefs.user_allows(models.UserSettings(chat_id=1, quiet_from=23, quiet_to=8), None, L(20, 2)))
+    quiet = models.UserSettings(chat_id=1, quiet_from=23, quiet_to=8)
+    check("Без тихих часов можно слать", userprefs.user_allows(base, L(20, 12)))
+    check("Вне тихих часов можно слать", userprefs.user_allows(quiet, L(20, 12)))
+    check("В тихие часы — нельзя", not userprefs.user_allows(quiet, L(20, 2)))
+    check("Тихие часы считаются по поясу пользователя",
+          userprefs.user_allows(models.UserSettings(chat_id=1, quiet_from=23, quiet_to=8, timezone_offset=10),
+                                datetime(2026, 10, 20, 23, 0)))
+    check("Заглушки матчей и стран удалены из userprefs",
+          not hasattr(userprefs, "country_key") and not hasattr(userprefs, "normalize_country"))
 
     mk = lambda **kw: models.Prediction(text="t", match_time=L(20, 18), **kw)
     now = L(20, 17)
@@ -1465,14 +1459,17 @@ def test_storage_journal_aliases_settings():
         check("Удаление несуществующего", storage.remove_alias("нет такого") is False)
 
     with _Env() as env:
-        def add(i):
-            storage.update_settings(7, lambda s: s.muted_ids.append(f"m{i}"))
+        storage.update_settings(7, lambda s: setattr(s, "timezone_offset", 0))
+
+        def bump(_i):
+            storage.update_settings(7, lambda s: setattr(s, "timezone_offset", s.timezone_offset + 1))
         with ThreadPoolExecutor(max_workers=8) as ex:
-            list(ex.map(add, range(20)))
-        check("update_settings атомарен: 20 параллельных добавлений — ничего не потеряно",
-              len(storage.load_settings(7).muted_ids) == 20)
+            list(ex.map(bump, range(20)))
+        check("update_settings атомарен: 20 параллельных увеличений — ни одно не потеряно",
+              storage.load_settings(7).timezone_offset == 20)
         storage.update_settings(7, lambda s: setattr(s, "quiet_from", 23))
-        check("Прочие поля при этом сохраняются", storage.load_settings(7).quiet_from == 23 and len(storage.load_settings(7).muted_ids) == 20)
+        check("Прочие поля при этом сохраняются", storage.load_settings(7).quiet_from == 23
+              and storage.load_settings(7).timezone_offset == 20)
 
 
 def test_undetermined_buttons_flow():
@@ -1570,12 +1567,10 @@ def test_scheduler_fonbet_tick_integration():
         events = {"en": [_utc_event("alpha beta kappa", "delta epsilon omega", start)]}
         rec, calls, restore = _tick_env(events)
         try:
-            storage.update_settings(222, lambda s: s.blocked_countries.append("poland"))
             asyncio.run(scheduler._fonbet_tick_inner(None))
             line_msgs = [m for m in rec.sent if "ЛИНИЮ" in m["text"]]
             check("Найден по пониженному порогу (same_slot) → уведомление «вышел в линию»", len(line_msgs) == 1)
-            check("Получатель с заблокированной страной уведомление не получил", line_msgs[0]["to"] == [111])
-            check("К уведомлению привязан прогноз (кнопки «заглушить»)", line_msgs[0]["pred"] == pred.id)
+            check("Уведомление получили оба получателя", line_msgs[0]["to"] == [111, 222])
             saved_pred = env.sched()[0]
             check("Статус сохранён: найден, «в линии»", saved_pred.fonbet_matched and saved_pred.fonbet_state == "line")
             j = storage.journal_recent(5, "found")
@@ -1621,19 +1616,18 @@ def test_scheduler_fonbet_tick_integration():
         finally:
             restore()
 
-    # Тихие часы и заглушка
+    # Тихие часы
     with _Env() as env:
         pred = models.Prediction(text=pred_text, match_time=start, source="manual")
         storage.save_predictions(predictions=[pred])
         hour = (now + timedelta(hours=TZ)).hour
         storage.update_settings(111, lambda s: (setattr(s, "quiet_from", hour), setattr(s, "quiet_to", (hour + 2) % 24)))
-        storage.update_settings(222, lambda s: s.muted_ids.append(pred.id))
         rec, calls, restore = _tick_env({"en": [_utc_event("alpha beta gamma", "delta epsilon zeta", start)]})
         try:
             asyncio.run(scheduler._fonbet_tick_inner(None))
             line = [m for m in rec.sent if "ЛИНИЮ" in m["text"]]
-            check("Тихие часы у одного, заглушенный матч у другого → уведомление никому не ушло, но матч найден",
-                  (not line or line[0]["to"] == []) and env.sched()[0].fonbet_matched)
+            check("Тихие часы у одного получателя → уведомление идёт только второму, матч найден",
+                  len(line) == 1 and line[0]["to"] == [222] and env.sched()[0].fonbet_matched)
         finally:
             restore()
 
@@ -1691,19 +1685,19 @@ def test_scheduler_miss_journal():
             storage.update_settings(222, lambda s: setattr(s, "notify_reminders", True))
             asyncio.run(scheduler.notification_tick(None))
             r = [m for m in rec.sent if "30" in m["text"] or "мин" in m["text"]]
-            check("Напоминание за 30 минут приходит получателям и несёт прогноз для кнопок", r and r[0]["pred"] == tz_pred.id)
-            storage.update_settings(222, lambda s: s.blocked_countries.append("poland"))
+            check("Напоминание за 30 минут приходит обоим получателям", r and r[0]["to"] == [111, 222])
+            hour = (datetime.utcnow() + timedelta(hours=TZ)).hour
+            storage.update_settings(222, lambda s: (setattr(s, "quiet_from", hour), setattr(s, "quiet_to", (hour + 2) % 24)))
             storage.update_prediction(pred_id=tz_pred.id, notified_30=False)
             rec.sent.clear()
             asyncio.run(scheduler.notification_tick(None))
-            check("Напоминание не уходит тем, кто заблокировал страну", all(222 not in m["to"] for m in rec.sent) and rec.sent)
+            check("Напоминание не уходит тому, у кого сейчас тихие часы", rec.sent and all(222 not in m["to"] for m in rec.sent))
         finally:
             restore()
 
 
 def test_handlers_pure_bits():
     print("\n[Кнопки: callback_data в лимите Telegram]")
-    check("mute|<id> короткий", len(f"mute|{models.Prediction(text='t', match_time=L(20,12)).id}".encode()) <= 64)
     mid = "1234567890123456789"
     item = {"mid": mid, "h8": storage._h8("ключ"), "text": "t"}
     check("ud|<19-значный id>|<h8>|<ГГММДД> укладывается в 64 байта",
@@ -1753,16 +1747,11 @@ def test_handlers_smoke():
         u, c = upd(args=["99"]); asyncio.run(handlers.cmd_quiet(u, c))
         check("/quiet с мусором — подсказка формата", "Формат" in said(u))
 
-        u, c = upd(args=["Poland"]); asyncio.run(handlers.cmd_block(u, c))
-        check("/block Poland", storage.load_settings(5).blocked_countries == ["poland"])
-        u, c = upd(args=["poland"]); asyncio.run(handlers.cmd_block(u, c))
-        check("Повторный /block не дублирует", storage.load_settings(5).blocked_countries == ["poland"])
+        # заглушка матчей и блокировка стран удалены: команд нет, /today без пометок
         u, c = upd(); asyncio.run(handlers.cmd_today(u, c))
-        check("/today помечает заблокированную страну 🚫", "🚫" in said(u))
-        u, c = upd(args=[]); asyncio.run(handlers.cmd_block(u, c))
-        check("/block без аргумента — список", "Poland" in said(u))
-        u, c = upd(args=["Poland"]); asyncio.run(handlers.cmd_unblock(u, c))
-        check("/unblock", storage.load_settings(5).blocked_countries == [])
+        check("/today без пометок 🔕/🚫", "🔕" not in said(u) and "🚫" not in said(u))
+        check("Команд /block, /unblock, /unmute больше нет",
+              not any(hasattr(handlers, n) for n in ("cmd_block", "cmd_unblock", "cmd_unmute")))
 
         # кнопки
         def cb(data, uid=5):
@@ -1771,18 +1760,15 @@ def test_handlers_smoke():
             u = MagicMock(); u.callback_query = q
             return u, q
         u, q = cb(f"mute|{p1.id}")
-        asyncio.run(handlers.on_callback(u, MagicMock()))
-        check("Кнопка «Заглушить матч»: сохранено и показан тост", p1.id in storage.load_settings(5).muted_ids and q.answer.await_count == 1)
-        u, c = upd(); asyncio.run(handlers.cmd_today(u, c))
-        check("/today помечает заглушённый матч 🔕", "🔕" in said(u))
-        u, q = cb(f"blk|{p2.id}")
-        asyncio.run(handlers.on_callback(u, MagicMock()))
-        check("Кнопка «🚫 страна»: страна заблокирована", "poland" in storage.load_settings(5).blocked_countries)
-        u, q = cb("blk|нетакого")
-        asyncio.run(handlers.on_callback(u, MagicMock()))
-        check("Кнопка по завершённому матчу — понятное сообщение, без падения", q.answer.await_count == 1)
-        u, c = upd(); asyncio.run(handlers.cmd_unmute(u, c))
-        check("/unmute очищает заглушённые", storage.load_settings(5).muted_ids == [])
+        before = storage.load_settings(5).to_dict()
+        try:
+            asyncio.run(handlers.on_callback(u, MagicMock()))
+            crashed = False
+        except Exception:
+            crashed = True
+        check("Кнопка «mute|…» из старого сообщения: бот не падает, настройки не меняются",
+              not crashed and storage.load_settings(5).to_dict() == before)
+        check("…и индикатор загрузки на кнопке гаснет (callback подтверждён)", q.answer.await_count == 1)
 
         # диагностика
         health.reset()

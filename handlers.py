@@ -96,7 +96,7 @@ async def _send_help(update: Update, user_id: int):
             "/clear — очистить все\n"
             "/settings — настройки\n"
             "/today — матчи на сегодня со статусом\n"
-            "/quiet, /block, /unblock, /unmute — личные фильтры\n"
+            "/quiet — тихие часы\n"
             "/broadcast — рассылка всем\n\n"
             "🩺 *Диагностика:*\n"
             "/status — здоровье бота (Фонбет, Discord)\n"
@@ -117,8 +117,6 @@ async def _send_help(update: Update, user_id: int):
             "/today — матчи на сегодня и что с ними на Фонбете\n"
             "/settings — твои настройки (часовой пояс, уведомления)\n"
             "/quiet 23 8 — тихие часы (не беспокоить с 23 до 8), `/quiet off` — выключить\n"
-            "/block Poland — не получать матчи страны (`/unblock`, список — `/block`)\n"
-            "/unmute — вернуть заглушённые матчи\n"
             "/feedback — сообщить о баге или оставить отзыв\n\n"
             "🔔 Уведомления о матчах ты получаешь автоматически.\n"
             "Полный список команд: /commands\n\n"
@@ -139,9 +137,6 @@ COMMANDS_USER = [
     ("today",    "",                    "матчи на сегодня и статус каждого на Фонбете"),
     ("settings", "",                    "часовой пояс и категории уведомлений"),
     ("quiet",    "23 8 | off",          "тихие часы: не беспокоить в этот интервал"),
-    ("block",    "<страна>",            "не получать матчи страны (без аргумента — список)"),
-    ("unblock",  "<страна>",            "снова получать матчи страны"),
-    ("unmute",   "",                    "вернуть заглушённые матчи"),
     ("feedback", "",                    "отправить отзыв или баг-репорт админу"),
     ("cancel",   "",                    "отменить текущий ввод"),
 ]
@@ -1101,7 +1096,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if (q.data or "").startswith(("mute|", "blk|", "ud|")):
+    if (q.data or "").startswith("ud|"):
         return await on_action_callback(update, ctx)
     user_id = q.from_user.id
     chat_id = q.message.chat_id
@@ -1164,7 +1159,6 @@ async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     mine = [p for p in preds if (p.match_time + tz).date() <= today]
     later = [p for p in preds if (p.match_time + tz).date() > today]
-    blocked = set(s.blocked_countries or [])
 
     if not mine:
         text = f"📅 На сегодня ({today:%d.%m}) прогнозов нет."
@@ -1176,13 +1170,8 @@ async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = [f"📅 Сегодня, {today:%d.%m}: {len(mine)}\n"]
     for i, p in enumerate(mine, 1):
         emoji, status = userprefs.match_status(p, now)
-        marks = ""
-        if p.id in (s.muted_ids or []):
-            marks += " 🔕"
-        if blocked and userprefs.country_key(p.text) in blocked:
-            marks += " 🚫"
         t = format_time_local(p, s.timezone_offset)
-        lines.append(f"{i}. ⏰ {t} {emoji} {status}{marks}\n   {display_text_without_time(p, s.timezone_offset)}")
+        lines.append(f"{i}. ⏰ {t} {emoji} {status}\n   {display_text_without_time(p, s.timezone_offset)}")
     if later:
         lines.append(f"\nНа следующие дни: {len(later)} — /list")
     if s.quiet_from is not None and userprefs.in_quiet_hours(s.quiet_from, s.quiet_to, now, s.timezone_offset):
@@ -1190,7 +1179,7 @@ async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _send_chunked(update, lines, limit=3900)
 
 
-# ── Личные фильтры: тихие часы, страны, заглушённые матчи ────────────────────
+# ── Личный фильтр: тихие часы ────────────────────
 
 @require_auth
 async def cmd_quiet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1219,50 +1208,6 @@ async def cmd_quiet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Формат: `/quiet 23 8` (часы 0–23, начало и конец разные) или `/quiet off`",
                                         parse_mode="Markdown")
-
-
-@require_auth
-async def cmd_block(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    name = userprefs.normalize_country(" ".join(ctx.args or []))
-    if not name:
-        s = storage.load_settings(user_id)
-        if not s.blocked_countries:
-            await update.message.reply_text("🚫 Заблокированных стран нет.\nДобавить: `/block Poland` "
-                                            "(название — как в начале прогноза).", parse_mode="Markdown")
-        else:
-            await update.message.reply_text("🚫 Заблокированные страны:\n" +
-                                            "\n".join(f"• {c.title()}" for c in s.blocked_countries) +
-                                            "\n\nУбрать: `/unblock Poland`", parse_mode="Markdown")
-        return
-    storage.update_settings(user_id, lambda s: s.blocked_countries.append(name)
-                            if name not in s.blocked_countries else None)
-    await update.message.reply_text(f"🚫 Матчи страны «{name.title()}» больше не приходят. Вернуть: /unblock {name}")
-
-
-@require_auth
-async def cmd_unblock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    name = userprefs.normalize_country(" ".join(ctx.args or []))
-    if not name:
-        await update.message.reply_text("Формат: `/unblock Poland`", parse_mode="Markdown")
-        return
-    had = []
-
-    def mut(s):
-        if name in s.blocked_countries:
-            s.blocked_countries.remove(name)
-            had.append(1)
-    storage.update_settings(user_id, mut)
-    await update.message.reply_text(f"✅ «{name.title()}» разблокирована." if had else f"«{name.title()}» не была заблокирована.")
-
-
-@require_auth
-async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    count = []
-    storage.update_settings(user_id, lambda s: (count.append(len(s.muted_ids)), s.muted_ids.clear()))
-    await update.message.reply_text(f"🔔 Заглушённые матчи возвращены: {count[0] if count else 0}.")
 
 
 # ── Диагностика (админ) ──────────────────────────────────────────────────────
@@ -1399,6 +1344,7 @@ async def cmd_undetermined(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Кнопки действий: заглушить матч / страну, дата неопределённого матча ─────
 
 async def on_action_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Кнопки действий. Сейчас одна: выбор даты матча с неопределённой датой (только админ)."""
     q = update.callback_query
     user_id = q.from_user.id
     if not auth.is_authorized(user_id):
@@ -1406,28 +1352,7 @@ async def on_action_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     kind, _, rest = (q.data or "").partition("|")
 
-    if kind == "mute":
-        pred_id = rest
-
-        def mut(s):
-            if pred_id not in s.muted_ids:
-                s.muted_ids.append(pred_id)
-            live = {p.id for p in storage.load_predictions()}
-            s.muted_ids[:] = [i for i in s.muted_ids if i in live]   # старые id чистим
-        storage.update_settings(user_id, mut)
-        await q.answer("🔕 Матч заглушен — по нему больше не будет уведомлений. Вернуть: /unmute", show_alert=True)
-
-    elif kind == "blk":
-        pred = next((p for p in storage.load_predictions() if p.id == rest), None)
-        country = userprefs.country_key(pred.text) if pred else ""
-        if not country:
-            await q.answer("Матч уже завершён — заблокируй страну командой /block <страна>", show_alert=True)
-            return
-        storage.update_settings(user_id, lambda s: s.blocked_countries.append(country)
-                                if country not in s.blocked_countries else None)
-        await q.answer(f"🚫 Страна «{country.title()}» заблокирована. Вернуть: /unblock {country}", show_alert=True)
-
-    elif kind == "ud":
+    if kind == "ud":
         if not auth.is_admin(user_id):
             await q.answer("⛔ Только админ.", show_alert=True)
             return

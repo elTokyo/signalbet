@@ -1042,7 +1042,7 @@ def toggle_setting(user_id: int, field: str) -> UserSettings:
 def update_settings(user_id: int, mutate) -> UserSettings:
     """
     Атомарно меняет настройки пользователя: свежее чтение → mutate(settings) → запись.
-    Нужно для списков (muted_ids, blocked_countries), которые toggle_setting не умеет.
+    Нужно для не булевых полей (тихие часы и т.п.), которые toggle_setting не умеет.
     """
     with _lock:
         gist_storage.invalidate_cache()

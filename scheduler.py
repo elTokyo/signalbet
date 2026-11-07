@@ -123,16 +123,16 @@ async def notification_tick(app: Application):
         diff_min = (pred.match_time - now).total_seconds() / 60
 
         if not pred.notified_30 and 28 <= diff_min <= 32:
-            rcpt = _allowed(recipients, pred, now, cache)
+            rcpt = _allowed(recipients, now, cache)
             if rcpt:
-                await _broadcast(app, rcpt, format_reminder(pred, 30), pred=pred)
+                await _broadcast(app, rcpt, format_reminder(pred, 30))
             pred.notified_30 = True
             changed = True
 
         if not pred.notified_5 and 3 <= diff_min <= 7:
-            rcpt = _allowed(recipients, pred, now, cache)
+            rcpt = _allowed(recipients, now, cache)
             if rcpt:
-                await _broadcast(app, rcpt, format_reminder(pred, 5), pred=pred)
+                await _broadcast(app, rcpt, format_reminder(pred, 5))
             pred.notified_5 = True
             changed = True
 
@@ -149,9 +149,9 @@ def _user_settings(rid: int, cache: dict):
     return cache[rid]
 
 
-def _allowed(rids: list[int], pred, now: datetime, cache: dict) -> list[int]:
-    """Получатели, которым по личным фильтрам (тихие часы, заглушка матча, страна) можно слать."""
-    return [r for r in rids if userprefs.user_allows(_user_settings(r, cache), pred, now)]
+def _allowed(rids: list[int], now: datetime, cache: dict) -> list[int]:
+    """Получатели, которым сейчас можно слать (вне их тихих часов)."""
+    return [r for r in rids if userprefs.user_allows(_user_settings(r, cache), now)]
 
 
 async def _journal_miss_if_any(pred):
@@ -258,12 +258,12 @@ async def _fonbet_tick_inner(app: Application):
 
     settings_cache: dict = {}
 
-    # Хелпер: получатели по категории уведомления + личные фильтры (тихие часы, заглушка, страна)
-    def recipients_for(field: str, pred=None) -> list[int]:
+    # Хелпер: получатели по категории уведомления + личный фильтр (тихие часы)
+    def recipients_for(field: str) -> list[int]:
         out = []
         for rid in all_recipients:
             st = _user_settings(rid, settings_cache)
-            if getattr(st, field, True) and userprefs.user_allows(st, pred, now):
+            if getattr(st, field, True) and userprefs.user_allows(st, now):
                 out.append(rid)
         return out
 
@@ -334,7 +334,7 @@ async def _fonbet_tick_inner(app: Application):
                 changed = True
                 odds_part = odds_line if has_odds else "(коэф. так и не появились)"
                 msg = _format_live_message(team1, team2, odds_part, pred.text)
-                await _broadcast(app, recipients_for("notify_match_out", pred), msg, url=match_url, pred=pred)
+                await _broadcast(app, recipients_for("notify_match_out"), msg, url=match_url)
                 logger.info(
                     f"[fonbet LIVE{'' if has_odds else ' no-odds timeout'}] {team1} — {team2} "
                     f"(признак: {event.get('live_reason')}, линия была: {was_in_line})"
@@ -357,7 +357,7 @@ async def _fonbet_tick_inner(app: Application):
                     f"{odds_line}\n\n"
                     f"📝 Прогноз:\n{pred.text}"
                 )
-                await _broadcast(app, recipients_for("notify_match_out", pred), msg, url=match_url, pred=pred)
+                await _broadcast(app, recipients_for("notify_match_out"), msg, url=match_url)
                 logger.info(f"[fonbet LINE] {team1} — {team2}")
             elif past_deadline:
                 _sent_prematch.add(pred.id)
@@ -369,7 +369,7 @@ async def _fonbet_tick_inner(app: Application):
                     f"(коэф. так и не появились)\n\n"
                     f"📝 Прогноз:\n{pred.text}"
                 )
-                await _broadcast(app, recipients_for("notify_match_out", pred), msg, url=match_url, pred=pred)
+                await _broadcast(app, recipients_for("notify_match_out"), msg, url=match_url)
                 logger.info(f"[fonbet LINE no-odds timeout] {team1} — {team2}")
             else:
                 logger.info(f"[fonbet LINE waiting odds] {team1} — {team2}")
@@ -394,7 +394,7 @@ async def _fonbet_tick_inner(app: Application):
                     f"⚡ {crooked['reason']}\n"
                     f"{crooked['odds_info']}"
                 )
-                await _broadcast(app, recipients_for(field, pred), msg, url=crooked.get("url"), pred=pred)
+                await _broadcast(app, recipients_for(field), msg, url=crooked.get("url"))
                 logger.info(
                     f"[fonbet {crooked.get('kind', 'crooked').upper()}] "
                     f"{team1} — {team2}: {crooked['reason']}"
@@ -420,7 +420,7 @@ async def _fonbet_tick_inner(app: Application):
                         f"⚡ {close['reason']}\n"
                         f"{close['odds_info']}"
                     )
-                    await _broadcast(app, recipients_for("notify_close_match", pred), msg, url=close.get("url"), pred=pred)
+                    await _broadcast(app, recipients_for("notify_close_match"), msg, url=close.get("url"))
                     logger.info(
                         f"[fonbet CLOSE_MATCH] {team1} — {team2}: {close['reason']}"
                     )
@@ -454,9 +454,9 @@ async def _bookmakers_followup(app: Application, pred, team1: str, team2: str, f
         recipients = [
             rid for rid in storage.get_all_recipient_chat_ids()
             if getattr(_user_settings(rid, cache), field, True)
-            and userprefs.user_allows(_user_settings(rid, cache), pred, now_f)
+            and userprefs.user_allows(_user_settings(rid, cache), now_f)
         ]
-        await _broadcast(app, recipients, f"{team1} — {team2}\n{text}", pred=pred)
+        await _broadcast(app, recipients, f"{team1} — {team2}\n{text}")
         logger.info(f"[BK] {team1} — {team2}: отправлен довесок по конторам")
     except Exception as e:
         logger.error(f"Bookmakers followup error: {e}")
@@ -489,22 +489,11 @@ def _format_odds(odd_p1, odd_p2) -> str:
 
 # ── Утилита broadcast ────────────────────────────────────────────────────────
 
-async def _broadcast(app: Application, chat_ids: list[int], text: str, url: str = None, pred=None):
-    """
-    Отправляет сообщение всем получателям. Если задан url — кнопка «Открыть на Фонбете».
-    Если передан прогноз — кнопки «🔕 Заглушить матч» и «🚫 <страна>» (личные фильтры
-    каждого нажавшего, см. handlers.on_action_callback).
-    """
-    rows = []
+async def _broadcast(app: Application, chat_ids: list[int], text: str, url: str = None):
+    """Отправляет сообщение всем получателям. Если задан url — кнопка «Открыть на Фонбете»."""
+    markup = None
     if url:
-        rows.append([InlineKeyboardButton("📲 Открыть на Фонбете", url=url)])
-    if pred is not None:
-        row = [InlineKeyboardButton("🔕 Заглушить матч", callback_data=f"mute|{pred.id}")]
-        country = userprefs.country_key(pred.text)
-        if country:
-            row.append(InlineKeyboardButton(f"🚫 {country.title()[:22]}", callback_data=f"blk|{pred.id}"))
-        rows.append(row)
-    markup = InlineKeyboardMarkup(rows) if rows else None
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Открыть на Фонбете", url=url)]])
     for chat_id in chat_ids:
         try:
             await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)

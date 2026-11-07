@@ -122,9 +122,6 @@ def main():
     app.add_handler(CommandHandler("undetermined", handlers.cmd_undetermined))
     app.add_handler(CommandHandler("today",        handlers.cmd_today))
     app.add_handler(CommandHandler("quiet",        handlers.cmd_quiet))
-    app.add_handler(CommandHandler("block",        handlers.cmd_block))
-    app.add_handler(CommandHandler("unblock",      handlers.cmd_unblock))
-    app.add_handler(CommandHandler("unmute",       handlers.cmd_unmute))
     app.add_handler(CommandHandler("broadcast", handlers.cmd_broadcast))
     app.add_handler(CommandHandler("cancel",    handlers.cmd_cancel))
 

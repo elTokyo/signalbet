@@ -1,30 +1,10 @@
 """
 Личные фильтры уведомлений и статус матча для /today. Чистые функции (без Gist/Telegram).
 
-  • тихие часы   — не слать уведомления в заданные часы (по местному времени пользователя);
-  • заглушенный матч — id прогноза в UserSettings.muted_ids;
-  • заблокированная страна — нормализованное название первой части заголовка прогноза.
+  • тихие часы — не слать уведомления в заданные часы (по местному времени пользователя).
 """
-import re
 from datetime import datetime, timedelta
 from typing import Optional
-
-
-def _tokens(s: str) -> list[str]:
-    return re.findall(r"[a-zа-яё0-9]+", (s or "").lower().replace("ё", "е"))
-
-
-def normalize_country(name: str) -> str:
-    """Нормализованное название страны: слова в нижнем регистре через пробел."""
-    return " ".join(_tokens(name))
-
-
-def country_key(pred_text: str) -> str:
-    """Страна из прогноза: первый сегмент заголовка до времени («Poland. 4 Liga…» → «poland»)."""
-    from fonbet import prediction_league_header
-    header = prediction_league_header(pred_text)
-    segs = [s for s in re.split(r'\.\s+|\s-\s', header) if s.strip()]
-    return normalize_country(segs[0]) if segs else ""
 
 
 def in_quiet_hours(quiet_from: Optional[int], quiet_to: Optional[int], now_utc: datetime, tz_offset: int) -> bool:
@@ -37,15 +17,8 @@ def in_quiet_hours(quiet_from: Optional[int], quiet_to: Optional[int], now_utc: 
     return h >= quiet_from or h < quiet_to
 
 
-def user_allows(settings, pred, now_utc: datetime) -> bool:
-    """Можно ли слать этому пользователю уведомление по этому прогнозу."""
-    if pred is None:
-        return not in_quiet_hours(settings.quiet_from, settings.quiet_to, now_utc, settings.timezone_offset)
-    if pred.id in (settings.muted_ids or []):
-        return False
-    blocked = settings.blocked_countries or []
-    if blocked and country_key(pred.text) in blocked:
-        return False
+def user_allows(settings, now_utc: datetime) -> bool:
+    """Можно ли сейчас слать этому пользователю уведомление (не попадает ли в его тихие часы)."""
     return not in_quiet_hours(settings.quiet_from, settings.quiet_to, now_utc, settings.timezone_offset)
 
 

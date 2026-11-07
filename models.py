@@ -82,12 +82,9 @@ class UserSettings:
     notify_voice: bool = True            # заход/выход в голосовой Discord
     # Legacy-поле (раньше отвечало за прематч+лайв+кривые). Оставляем для миграции.
     fonbet_notifications: bool = True
-    # Фильтры (личные): тихие часы по местному времени пользователя, заглушенные матчи
-    # (id прогнозов) и заблокированные страны (нормализованные, см. userprefs.country_key)
+    # Личный фильтр: тихие часы по местному времени пользователя (оба None = выключены)
     quiet_from: Optional[int] = None
     quiet_to: Optional[int] = None
-    muted_ids: list = field(default_factory=list)
-    blocked_countries: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -103,8 +100,6 @@ class UserSettings:
             "fonbet_notifications": self.fonbet_notifications,
             "quiet_from": self.quiet_from,
             "quiet_to": self.quiet_to,
-            "muted_ids": list(self.muted_ids),
-            "blocked_countries": list(self.blocked_countries),
         }
 
     @classmethod
@@ -125,6 +120,4 @@ class UserSettings:
             fonbet_notifications=legacy_fonbet,
             quiet_from=d.get("quiet_from"),
             quiet_to=d.get("quiet_to"),
-            muted_ids=list(d.get("muted_ids") or []),
-            blocked_countries=list(d.get("blocked_countries") or []),
         )
